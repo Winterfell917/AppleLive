@@ -50,3 +50,17 @@ venv.bak/
 **/data/
 **/tranpose/
 **/a.mp4
+
+# Keep only the pretrained weights required by the runnable live demos.
+# Recorded sequences and every other file under data/ remain ignored.
+!mobileposer/data/
+mobileposer/data/*
+!mobileposer/data/checkpoints/
+mobileposer/data/checkpoints/*
+!mobileposer/data/checkpoints/base_model_12combo.pth
+!mobileposer/data/checkpoints/combo_imu_calibrator_lw_rp_h_ori_only_jerk_nopose_fulltrain_tb_noncausal/
+mobileposer/data/checkpoints/combo_imu_calibrator_lw_rp_h_ori_only_jerk_nopose_fulltrain_tb_noncausal/*
+!mobileposer/data/checkpoints/combo_imu_calibrator_lw_rp_h_ori_only_jerk_nopose_fulltrain_tb_noncausal/best.pt
+!mobileposer/data/checkpoints/tic_calibrator_amass_full/
+mobileposer/data/checkpoints/tic_calibrator_amass_full/*
+!mobileposer/data/checkpoints/tic_calibrator_amass_full/best.pt

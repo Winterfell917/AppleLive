@@ -18,7 +18,7 @@ class MotionViewer:
     colors = matplotlib.colormaps['tab10'].colors
     
     ip = '127.0.0.1'
-    port = 8000
+    port = 8989
 
     def __init__(self, n=1, overlap=True, names=None, fps=30):
         r"""

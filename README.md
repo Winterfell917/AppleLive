@@ -1,164 +1,111 @@
-# MobilePoser: Real-Time Full-Body Pose Estimation and 3D Human Translation from IMUs in Mobile Consumer Devices
-Author's implementation of the paper [MobilePoser: Real-Time Full-Body Pose Estimation and 3D Human Translation from IMUs in Mobile Consumer Devices](https://dl.acm.org/doi/pdf/10.1145/3654777.3676461). This work was published at UIST'24.
+# MocapPipe
 
-<br>
-<div align="center">
-<img src="teaser.gif" alt="teaser.gif" width="100%">
-</div>
-<br>
+基于少量消费级 IMU 的实时全身动作捕捉项目。当前精简版保留：
 
-## Installation 
-We recommend configuring the project inside an Anaconda environment. We have tested everything using [Anaconda](https://docs.anaconda.com/anaconda/install/) version 23.9.0 and Python 3.9. The first step is to create a virtual environment, as shown below (named `mobileposer`).
-```
+- MobilePoser 核心姿态、关节、足部接触和速度模型；
+- Apple Watch + iPhone + AirPods 实时接入；
+- 华为设备实时接入；
+- ComboTemporal 与 TIC 在线 IMU 校准器；
+- SMPL 人体模型与 Unity MotionViewer 输出；
+- 实时运行所需的预训练权重。
+
+## 安装
+
+推荐 Python 3.9：
+
+```bash
 conda create -n mobileposer python=3.9
-```
-You should then activate the environment as shown below. All following operations must be completed within the virtual environment.
-```
 conda activate mobileposer
-```
-Then, install the required packages.
-```
 pip install -r requirements.txt
-```
-You will then need to install the local mobileposer package for development via the command below. You must run this from the root directory (e.g., where setup.py is).
-```
 pip install -e .
 ```
 
-## Process Datasets
+实时脚本采用项目原有的顶层导入方式，请从 `mobileposer` 目录运行：
 
-### Download Training Data
-1. Register and download the AMASS dataset from [here](https://amass.is.tue.mpg.de/). We use 'SMPLH+G' for each dataset. 
-2. Register and download the DIP-IMU dataset from [here](https://dip.is.tuebingen.mpg.de/). Download the raw (unormalized) data.
-3. Request access to the TotalCapture dataset [here](https://cvssp.org/data/totalcapture/). Download Vicon Groundtruth in the raw folder, and IMU data in the IMU folder. 
-4. Download the IMUPoser dataset from [here](https://github.com/FIGLAB/IMUPoser).
-
-Once downloaded, your directory might appear as follows:
 ```bash
-data
-└── raw
-    ├── AMASS
-    │   ├── ACCAD
-    │   ├── BioMotionLab_NTroje
-    │   ├── BMLhandball
-    │   ├── ...
-    │   └── Transitions_mocap
-    ├── DIP_IMU
-    │   ├── s_01
-    │   ├── s_02
-    │   ├── s_03
-    │   ├── ...
-    │   └── s_10
-    ├── IMUPoser
-    │   ├── P1
-    │   ├── P2
-    │   ├── P3
-    │   ├── ...
-    │   └── P10
-    └── TotalCapture/
-            ├── IMU/
-            │   ├── s1_acting1.pkl
-            │   ├── ...
-            └── raw/
-                ├── S1/
-                │   ├── acting1/
-                │   │   ├── gt_skel_gbl_ori.txt
-                │   │   ├── gt_skel_gbl_pos.txt
-                │   ├── ...
+cd mobileposer
 ```
 
-### Setup Training Data 
-In `config.py`: 
-- Set `paths.processed_datasets` to the directory containing the pre-processed datasets.
-- Set `paths.raw_amass` to the directory containing the AMASS dataset.
-- Set `paths.raw_dip` to the directory containing the DIP dataset.
-- Set `paths.raw_imuposer` to the directory containing the IMUPoser dataset.
-  
-The script `process.py` drives the dataset pre-processing. This script takes the following parameters:
-1. `--dataset`: Dataset to pre-process (`amass`, `dip`, `imuposer`). Defaults to `amass`.
+## Apple 设备动作捕捉
 
-As an example, the following command will pre-process the DIP dataset. 
-```
-$ python process.py --dataset dip
-```
+Sensor Read 默认映射：
 
-## Training Models 
-The script `train.py` drives the training process. This script takes the following parameters:
-1. `--module`: Train an individual module (`poser`, `joints`, `foot_contact`, `velocity`). Default to training all modules. 
-2. `--init-from`: Initialize training from an existing checkpoint. Defaults to training from scratch. 
-3. `--finetune`: Specify dataset for finetuning module (e.g., `dip`). 
-4. `--fast-dev-run`: A boolean flag that caps the execution to a single epoch. This flag is useful for debugging.
+| 数据源 | 身体位置 | 模型槽位 |
+| --- | --- | ---: |
+| Apple Watch | 左腕 | 0 |
+| iPhone | 右口袋/右大腿 | 3 |
+| AirPods | 头部 | 4 |
 
-As an example, we can execute the following command to train all modules: 
-```
-$ python train.py
+先测试无可视化链路：
+
+```bash
+python livedemo_apple.py --no-viewer --duration 20
 ```
 
-### Finetuning Model
-To facilitate finetuning MobilePoser, we provide a script `finetune.sh`. To run this script, use the following syntax: 
-```
-$ ./finetune.sh <dataset-name> <checkpoint-directory>
-```
+运行带轻量火柴人预览的实时演示：
 
-### Prepare Model
-The script `combine_weights.py` combines the weights of individual modules into a single weight file that can be loaded into `MobilePoserNet`. 
-To run this script, use the following syntax: 
-```
-$ python combine_weights.py --finetune <dataset-name> --checkpoint <checkpoint-directory>
-```
-Omit the `--finetune` argument if you did not finetune. The resulting weight file will be stored under the same directory as the `checkpoint-directory>`
-
-
-### Download pre-trained network weights
-We provide a pre-trained model for the set of configurations listed in `config.py`. 
-1. Download weights from [here](https://uchicago.box.com/s/ey3y49srpo79propzvmjx0t8u3ael6cl). 
-2. In `config.py`, set the `paths.weights_file` to the model path.
-
-### Run Evaluation
-The script `evaluate.py` drives model evaluation. This script takes the following arguments. 
-1. `--model`: Path to the trained model.
-2. `--dataset`: Dataset to execute testing on (e.g., `dip`, `imuposer`, `totalcapture`).
-   
-As an example, we can execute the following concrete command:
-```
-$ python evaluate.py --model checkpoints/weights.pth --dataset dip
+```bash
+python livedemo_apple.py
 ```
 
-### Visualizing Results 
-To visualize the prediction results of the trained model, we provide a script `example.py`. This script takes the following arguments. 
-1. `--model`: Path to the trained model.
-2. `--dataset`: Dataset to execute prediction for visualization. Defaults to `dip`.
-3. `--seq-num`: Sequence nuber of dataset to execute prediction. Defaults to 1.
-4. `--with-tran`: A boolean flag to enable visualizing translation estimation. Defaults to False. 
-5. `--combo`: Device-location combination. Defaults to 'lw_rp' (left-wrist right-pocket).
-   
-Additionally, you can set the GT environment variable to customize visualization modes:
-- GT=1: Visualizes both predictions and ground-truth.
-- GT=2: Visualizes only the ground-truth data.
+按 subject/name 采集一段数据：
 
-As an example, we can execute the following concrete command:
-```
-$ GT=1 python example.py --model checkpoints/weights.pth --dataset dip --seq-num 5 --with-tran
+```bash
+python livedemo_apple.py --subject libo1_0901 --name 001
 ```
 
-Note, we recommend using your local machine to visualize the results. 
+数据保存到 `mobileposer/data/datasets/apple/libo1_0901/001/`。默认骨架预览
+在独立进程中只计算24个关节，不生成SMPL mesh，不会等待显示队列。
 
-## Citation 
+详见 [Apple 接入说明](mobileposer/APPLE_MOCAP.md)。
+
+## 华为设备动作捕捉
+
+启动传感器发送端和 Unity MotionViewer 后运行：
+
+```bash
+python livedemo.py --mocap
 ```
-@inproceedings{xu2024mobileposer,
-  title={MobilePoser: Real-Time Full-Body Pose Estimation and 3D Human Translation from IMUs in Mobile Consumer Devices},
-  author={Xu, Vasco and Gao, Chenfeng and Hoffmann, Henry and Ahuja, Karan},
-  booktitle={Proceedings of the 37th Annual ACM Symposium on User Interface Software and Technology},
-  pages={1--11},
-  year={2024}
-}
+
+三路校准对比：
+
+```bash
+python livedemo.py --mocap --compare-all
 ```
 
-## Contact
-For questions, please contact nu.spicelab@gmail.com.
+## 运行权重
 
-## Acknowledgements 
-We would like to thank the following projects for great prior work that inspired us: [TransPose](https://github.com/Xinyu-Yi/TransPose), [PIP](https://xinyu-yi.github.io/PIP/), [IMUPoser](https://github.com/FIGLAB/IMUPoser). 
+```text
+mobileposer/data/checkpoints/
+├── base_model_12combo.pth
+├── combo_imu_calibrator_lw_rp_h_ori_only_jerk_nopose_fulltrain_tb_noncausal/
+│   └── best.pt
+└── tic_calibrator_amass_full/
+    └── best.pt
+```
 
-## License 
-This work is licensed under the Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License. For commercial use, a separate commercial license is required. Please contact kahuja@northwestern.edu at Northwestern University for licensing inquiries.
+`smpl/basicmodel_m.pkl` 是实时姿态输出所必需的 SMPL 模型文件。
+
+## 目录结构
+
+```text
+mobileposer/
+├── livedemo.py             # 华为实时入口
+├── livedemo_apple.py       # Apple 实时入口
+├── sensor_huawei/          # 华为 UDP 与标定
+├── sensor_apple/           # Sensor Read UDP 与标定
+├── models/                 # 推理模型与在线校准器
+├── articulate/             # SMPL 数学与 Unity MotionViewer
+├── utils/model_utils.py    # 权重加载与姿态补全
+├── smpl/                   # SMPL 模型
+└── data/checkpoints/       # 运行权重
+```
+
+## 性能提示
+
+当前 MobilePoser 的小批量 Packed LSTM 在 Apple Silicon CPU 上明显快于项目所用
+PyTorch 2.1 MPS 后端，因此 `livedemo_apple.py --device auto` 在 Mac 上默认选择 CPU。
+
+## License
+
+本项目基于 MobilePoser，遵循仓库中的 [LICENSE](LICENSE)。

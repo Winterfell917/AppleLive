@@ -1,8 +1,7 @@
-"""
-Toolkit for articulated body system.
-"""
+"""Minimal articulated-body runtime used by MobilePoser."""
 
-from .armature import *
-from .evaluator import *
-from .model import *
 from . import math
+from . import model
+from .model import ParametricModel
+
+__all__ = ["math", "model", "ParametricModel"]

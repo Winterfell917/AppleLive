@@ -11,7 +11,6 @@ from utils.model_utils import load_model
 import numpy as np
 import matplotlib
 from argparse import ArgumentParser
-import keyboard
 from sensor_huawei.sensor import CalibratedHuaweiSensor
 import traceback
 import datetime
@@ -19,7 +18,6 @@ from models.imu_calibrator import ComboTemporalIMUCalibrator, build_imu_input
 from models.tic_calibrator import TICOnlineCalibrator, TICOperatorConfig, TICTransformerCalibrator
 
 colors = matplotlib.colormaps['tab10'].colors
-body_model = art.ParametricModel(paths.smpl_file, device='cuda')
 CALIBRATOR_COMBO = [0, 3, 4]
 
 
@@ -150,7 +148,7 @@ if __name__ == '__main__':
     )
     args = parser.parse_args()
 
-    device = torch.device("cuda")
+    device = model_config.device
     clock = Clock()
 
     if args.mocap:
@@ -252,8 +250,6 @@ if __name__ == '__main__':
 
                 print('\r', clock.get_fps(), end='')
 
-                if keyboard.is_pressed('q'):
-                    break
             except Exception as e:
                 print(f"Error occurred: {e}")
                 print(traceback.format_exc())

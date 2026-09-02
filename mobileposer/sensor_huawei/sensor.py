@@ -6,7 +6,20 @@ import threading
 import articulate as art
 import os
 import cv2
-import winsound
+
+try:
+    import winsound
+except ImportError:
+    winsound = None
+
+
+def beep(frequency=440, duration=600):
+    if winsound is not None:
+        winsound.Beep(frequency, duration)
+    else:
+        print("\a", end="", flush=True)
+
+
 np.set_printoptions(precision=10, suppress=True)
 torch.set_printoptions(sci_mode=False)
 class DataReceiver(threading.Thread):
@@ -230,7 +243,7 @@ class CalibratedHuaweiSensor(HuaweiSensor):
         self.cal_acc_bias()
         RIS_N0 = self.get()[4]
 
-        winsound.Beep(440, 600)
+        beep()
         print('Step forward now.')
         begin_t = last_t = self.get()[0][0]
         p, v = torch.zeros(self.N, 3), torch.zeros(self.N, 3)

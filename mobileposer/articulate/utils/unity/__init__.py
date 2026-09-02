@@ -1,7 +1,5 @@
-r"""
-    This package contains utils for Unity3D.
-"""
+"""Unity motion streaming used by the live demos."""
 
-from .view_motion import *
-from .view_vector3 import *
-from .view_trajectory import *
+from .view_motion import MotionViewer
+
+__all__ = ["MotionViewer"]
