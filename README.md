@@ -3,9 +3,9 @@
 基于少量消费级 IMU 的实时全身动作捕捉项目。当前精简版保留：
 
 - MobilePoser 核心姿态、关节、足部接触和速度模型；
-- Apple Watch + iPhone + AirPods 实时接入；
+- Apple Watch + iPhone（可选 AirPods）实时接入；
 - 华为设备实时接入；
-- ComboTemporal 与 TIC 在线 IMU 校准器；
+- CHI 2027 `ours`/`plain` 与 TIC 在线 IMU 校准器；
 - SMPL 人体模型与 Unity MotionViewer 输出；
 - 实时运行所需的预训练权重。
 
@@ -28,13 +28,38 @@ cd mobileposer
 
 ## Apple 设备动作捕捉
 
-Sensor Read 默认映射：
+### 设备和槽位
+
+Sensor Read 的默认设备映射为：
 
 | 数据源 | 身体位置 | 模型槽位 |
 | --- | --- | ---: |
 | Apple Watch | 左腕 | 0 |
 | iPhone | 右口袋/右大腿 | 3 |
 | AirPods | 头部 | 4 |
+
+项目支持只使用 Apple Watch 和 iPhone。两设备模式使用：
+
+```bash
+python livedemo_apple.py \
+  --source-slot apple_watch:0 \
+  --source-slot iphone:3 \
+  --calibrator nocalibration
+```
+
+未配置的 AirPods/头部槽位会以零值填入 MobilePoser 的固定五槽输入，因此可以
+完成实时推理，但精度和稳定性通常低于 Watch + iPhone + AirPods 三设备配置。
+两设备模式只支持 `none`/`nocalibration`；`ours`、`plain`、`tic` 以及
+`--compare-ours-nocalibration` 均要求槽位 0、3、4 同时存在。
+
+这里的 `nocalibration` 只表示不使用学习式在线 calibrator，默认的
+`walking_6dof` 物理坐标校准仍会执行。如需连物理校准也跳过，请额外传入
+`--calibration none`。
+
+### Sensor Read 和基本运行
+
+在 Sensor Read 中将接收地址设置为运行 Python 的电脑局域网 IP，UDP 端口设置为
+`9000`（脚本的默认 `--port`）。启动各设备采集后，从 `mobileposer` 目录运行。
 
 先测试无可视化链路：
 
@@ -47,6 +72,60 @@ python livedemo_apple.py --no-viewer --duration 20
 ```bash
 python livedemo_apple.py
 ```
+
+使用新版 CHI 2027 calibrator：
+
+```bash
+# 单独运行 Calibration 分支
+python livedemo_apple.py --calibrator ours
+
+# 同时计算 NoCalibration 和 Calibration；GTX 1650 建议 25 FPS
+python livedemo_apple.py --compare-ours-nocalibration --fps 25
+```
+
+比较模式维护两份独立的 MobilePoser 时序状态。保存文件中 `pose` 和
+`pose_ours` 为 Calibration 输出，`pose_nocalibration` 为未经过学习式
+calibrator 的输出。
+
+### Unity 可视化
+
+Unity MotionViewer 使用的连接与 Sensor Read UDP 端口无关。当前 Python
+MotionViewer 是 TCP 服务端，固定配置为：
+
+| Unity 设置 | 值 |
+| --- | --- |
+| Server/Host | `127.0.0.1` |
+| Port | `8989` |
+| Protocol | TCP |
+
+Unity 和 Python 需要运行在同一台电脑，因为服务端绑定的是本机回环地址。
+推荐启动顺序：
+
+1. 在 Unity 中打开 MotionViewer 场景，将 Host 设置为 `127.0.0.1`、Port 设置为 `8989`，暂不连接；
+2. 运行下面的 Python 命令，等待终端出现 `Waiting for unity3d to connect`；
+3. 在 Unity 中进入 Play 模式或点击连接。
+
+单路 Unity 可视化：
+
+```bash
+python livedemo_apple.py --viewer unity --calibrator nocalibration
+```
+
+双路 Unity 对比：
+
+```bash
+python livedemo_apple.py \
+  --viewer unity \
+  --compare-ours-nocalibration \
+  --fps 25
+```
+
+双路模式中，Unity 的两个角色标签分别为 `NoCalibration` 和 `Calibration`。
+如果出现端口占用错误，请先关闭其他 MotionViewer/Python 进程；如需改端口，需让
+Unity 客户端配置与 `mobileposer/articulate/utils/unity/view_motion.py` 中的
+`MotionViewer.port` 保持一致。
+
+### 数据采集
 
 按 subject/name 采集一段数据：
 
