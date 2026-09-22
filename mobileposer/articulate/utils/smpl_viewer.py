@@ -7,23 +7,53 @@ import multiprocessing as mp
 import os
 import queue
 import time
+from typing import Optional
 
 import numpy as np
 import torch
 
 
-def _project_joints(joints: np.ndarray, width: int, height: int) -> np.ndarray:
+DEFAULT_VIEWER_WIDTH = 640
+DEFAULT_VIEWER_HEIGHT = 640
+
+
+def _projected_model_y(joints: np.ndarray) -> np.ndarray:
+    return joints[:, 1] + 0.06 * joints[:, 2]
+
+
+def _project_joints(
+    joints: np.ndarray,
+    width: int,
+    height: int,
+    vertical_center: Optional[float] = None,
+) -> np.ndarray:
     """Project model-space SMPL joints into a stable, centered 2-D view."""
-    # A 1.7 m SMPL body now occupies about 63% of the window height.  Keep
-    # this scale fixed so the preview does not zoom in and out with each pose.
+    # The SMPL pelvis is at y=0 while the feet are near y=-1, so centering on
+    # model-space zero pushes the legs below the window.  Center the zero-pose
+    # bounds instead, and keep that center fixed while live poses are rendered.
     scale = min(width, height) / 2.70
     root = joints[0]
     centered = joints - np.asarray([root[0], 0.0, root[2]], dtype=np.float32)
     x = centered[:, 0] + 0.22 * centered[:, 2]
-    y = centered[:, 1] + 0.06 * centered[:, 2]
+    y = _projected_model_y(centered)
+    if vertical_center is None:
+        vertical_center = float((y.min() + y.max()) * 0.5)
     return np.stack(
-        (width * 0.5 + scale * x, height * 0.815 - scale * y), axis=1
+        (width * 0.5 + scale * x, height * 0.5 - scale * (y - vertical_center)), axis=1
     ).round().astype(np.int32)
+
+
+def _center_window(pygame, width: int, height: int) -> None:
+    """Set the SDL position before creating a window on the primary display."""
+    try:
+        desktop_width, desktop_height = pygame.display.get_desktop_sizes()[0]
+    except (AttributeError, IndexError, pygame.error):
+        os.environ["SDL_VIDEO_CENTERED"] = "1"
+        return
+    left = max(0, (desktop_width - width) // 2)
+    top = max(0, (desktop_height - height) // 2)
+    os.environ.pop("SDL_VIDEO_CENTERED", None)
+    os.environ["SDL_VIDEO_WINDOW_POS"] = f"{left},{top}"
 
 
 def _viewer_process(frame_queue, status_queue, model_path, title, width, height) -> None:
@@ -34,12 +64,20 @@ def _viewer_process(frame_queue, status_queue, model_path, title, width, height)
         from articulate.model import ParametricModel
 
         pygame.init()
+        _center_window(pygame, width, height)
         screen = pygame.display.set_mode((width, height))
         pygame.display.set_caption(title)
         bodymodel = ParametricModel(model_path, device=torch.device("cpu"))
         parents = tuple(bodymodel.parent)
         zero_joints, _ = bodymodel.get_zero_pose_joint_and_vertex()
         latest_joints = zero_joints.numpy()
+        zero_y = _projected_model_y(latest_joints)
+        vertical_center = float((zero_y.min() + zero_y.max()) * 0.5)
+        scale = min(width, height) / 2.70
+        floor_y = min(
+            height - 16,
+            round(height * 0.5 - scale * (float(zero_y.min()) - vertical_center) + 12),
+        )
         status_queue.put(("ready", None))
 
         background = (246, 248, 251)
@@ -87,8 +125,7 @@ def _viewer_process(frame_queue, status_queue, model_path, title, width, height)
                 rendered_frames += 1
 
             screen.fill(background)
-            points = _project_joints(latest_joints, width, height)
-            floor_y = int(height * 0.815)
+            points = _project_joints(latest_joints, width, height, vertical_center)
             pygame.draw.line(screen, floor_color, (width // 5, floor_y), (width * 4 // 5, floor_y), 2)
             for joint, parent in enumerate(parents):
                 if parent is None:
@@ -134,12 +171,14 @@ class LightweightSMPLViewer:
         self,
         model_path,
         fps: float = 30.0,
-        width: int = 900,
-        height: int = 900,
+        width: int = DEFAULT_VIEWER_WIDTH,
+        height: int = DEFAULT_VIEWER_HEIGHT,
         title: str = "Apple Mocap — Skeleton Preview",
     ) -> None:
         if fps <= 0:
             raise ValueError("Viewer FPS must be positive")
+        if width <= 0 or height <= 0:
+            raise ValueError("Viewer width and height must be positive")
         self.model_path = str(model_path)
         self.frame_period_s = 1.0 / fps
         self.width = width

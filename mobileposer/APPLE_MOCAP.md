@@ -39,8 +39,10 @@ retains its configured frame rate. Rendering runs in a separate process, its one
 drops an old display frame whenever necessary, and that display process computes
 only 24 SMPL joint positions—never mesh vertices. Change its refresh cap with
 `--viewer-fps 10`.
-The 900×900 window opens centered on macOS and its title bar reports the actual
-render FPS once per second. Closing the preview window does not stop mocap. The
+The 640×640 window opens centered on the primary display and its title bar
+reports the actual render FPS once per second. Override its size with, for
+example, `--viewer-width 720 --viewer-height 720`. Closing the preview window
+does not stop mocap. The
 previous Unity viewer remains available with `--viewer unity`; start the Unity
 MotionViewer client before using that option.
 
@@ -48,12 +50,12 @@ The default `auto` device selects CPU on Apple Silicon because this project's
 small packed-LSTM inference is much faster on CPU than on its current MPS
 runtime.  MPS can still be tested explicitly with `--device mps`.
 
-Live inference uses the slowest stream's latest clock-corrected sample time as
-an adaptive watermark. This lets iPhone and AirPods wait for a late Apple Watch
-batch without imposing a fixed delay. For each device, the receiver selects the
-real sample nearest to that watermark: acceleration, angular velocity, and
-rotation are never interpolated. The `--sync-delay` option has therefore been
-removed.
+After initial clock alignment, live inference independently takes the latest
+received sample from every configured device and concatenates those values for
+the network. Device timestamps retain their frozen clock offsets, but live
+frames are not required to share one watermark. A sample older than
+`--stale-after` is reported through `valid=False` while its latest acceleration,
+angular velocity, and rotation remain available to inference.
 
 The same native-frame matching is applied during calibration. The program marks
 the physical N-pose or walking window, waits only until every source has
@@ -77,8 +79,17 @@ Useful variants:
 # More robust yaw/reference alignment using a forward step
 python livedemo_apple.py --calibration walking_6dof
 
-# Apply the learned three-device calibration model
+# Run without a learned calibrator
+python livedemo_apple.py --calibrator nocalibration
+
+# Apply the CHI 2027 cross-device calibration model
 python livedemo_apple.py --calibrator ours
+
+# Run independent no-calibration and ours branches on every frame
+python livedemo_apple.py --compare-ours-nocalibration
+
+# Apply the CHI 2027 causal Plain Transformer baseline
+python livedemo_apple.py --calibrator plain
 
 # Listen to a subset or change body slots (repeat once per source)
 python livedemo_apple.py --source-slot apple_watch:0 --source-slot iphone:3
@@ -128,8 +139,8 @@ while the static N-pose calibration runs; when the computer beeps, step forward
 immediately. The beep opens a fixed three-second integration window, after
 which the forward direction is computed and mocap starts. It does not use a
 countdown or wait for step detection. No static accelerometer bias is estimated
-or subtracted. On macOS the cue is the system `Ping` sound played with `afplay`,
-so it does not depend on the terminal's audible-bell setting.
+or subtracted. On Windows the cue is a 440 Hz native tone lasting 600 ms. On
+hosts without `winsound`, it falls back to the terminal bell.
 
 ## Coordinate and variable convention
 
@@ -181,10 +192,10 @@ python livedemo_apple.py --no-viewer \
   --trial 001
 ```
 
-After calibration, recording starts immediately. The start
-beep marks the physical sequence boundary. Frames before that boundary are
-discarded while the adaptive Watch watermark catches up. When the action is
-complete, tap **End Collection** on Apple Watch. The phone records the Watch
+After calibration, recording starts immediately without another cue; the only
+beep is the start of the forward-step calibration window. Frames whose latest
+device timestamps still precede the recording boundary are discarded. When the
+action is complete, tap **End Collection** on Apple Watch. The phone records the Watch
 `control_event`; livedemo authorizes saving only when `action_stop=1`,
 `accepted=1`, `phone_was_recording=1`, and the `sessionID` matches the active
 streams. The iPhone also writes one `recording_end` marker locally and repeats
@@ -199,8 +210,8 @@ The initial sequence package is written to
   time range, model and coordinate conventions.
 - `calibration.json`: calibration method/windows, clock offsets, source-slot
   mapping, and full `RMI`/`RSB` matrices.
-- `mocap.pt`: timestamp-matched native IMU tensors, validity masks, and inferred
-  SMPL pose at the mocap frame rate.
+- `mocap.pt`: latest-per-device native IMU tensors, freshness masks, and
+  inferred SMPL pose at the mocap frame rate.
 
 After Sensor Read has ended and closed its local NDJSON, unlock the paired
 iPhone, then pull and crop only the matching session interval:
@@ -328,3 +339,18 @@ to be less accurate. Jump detection can be tuned with `--jump-search-offset`,
 `--jump-search-seconds`, and `--min-jump-prominence`. This stage does not yet
 align external ground-truth SMPL data; that can be added later without changing
 the processed IMU/pose time axis.
+
+## CHI 2027 direct-rotation calibrators
+
+The `ours` option loads
+`data/checkpoints/chi2027_calibrator_ours/best.pt`. It applies causal temporal
+and cross-device attention over a rolling 125-frame window, scales acceleration
+by 30 as in training, and replaces only slots 0/3/4 rotations before frozen
+MobilePoser inference. `plain` loads the per-frame-device-concatenation baseline
+from `data/checkpoints/chi2027_calibrator_plain/best.pt`.
+
+`--compare-ours-nocalibration` maintains two independent MobilePoser recurrent
+states. The lightweight skeleton viewer displays the `Calibration` result; the
+Unity viewer displays `NoCalibration` and `Calibration` side by side. Recordings retain
+`pose` as the compatible primary (`ours`) output and also store
+`pose_nocalibration`, `pose_ours`, and `ori_nocalibration`.

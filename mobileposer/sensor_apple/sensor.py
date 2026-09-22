@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import json
 import socket
-import subprocess
-import sys
 import threading
 import time
 from bisect import bisect_left
@@ -20,25 +18,22 @@ from typing import Deque, Dict, Iterable, Mapping, Optional
 
 import torch
 
+try:
+    import winsound
+except ImportError:
+    winsound = None
+
 
 GRAVITY = 9.80665
 NUM_MODEL_SLOTS = 7
 
 
-def beep() -> None:
-    """Play an audible calibration cue, with a terminal bell as fallback."""
-    if sys.platform == "darwin":
-        try:
-            subprocess.Popen(
-                ["/usr/bin/afplay", "/System/Library/Sounds/Ping.aiff"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            return
-        except OSError:
-            pass
-    print("\a", end="", flush=True)
+def beep(frequency=440, duration_ms=600) -> None:
+    """Best-effort calibration cue on Windows and headless Linux hosts."""
+    if winsound is not None:
+        winsound.Beep(frequency, duration_ms)
+    else:
+        print("\a", end="", flush=True)
 
 
 # MobilePoser slot order: left wrist, right wrist, left thigh, right thigh,
@@ -425,41 +420,6 @@ class AppleMocapSensor:
             gyroS=frame.gyroS,
         )
 
-    def _matched_frames(self, snapshot=None):
-        """Match real samples at the slowest stream's current timestamp watermark."""
-        if snapshot is None:
-            snapshot = self._synchronization_snapshot()
-        now, buffers, offsets, latest = snapshot
-
-        for source in self.required_sources:
-            newest = latest.get(source)
-            if (
-                newest is None
-                or offsets.get(source) is None
-                or now - newest.received_at_s > self.stale_after_s
-                or not buffers[source]
-            ):
-                return None, {}
-
-        # The minimum latest timestamp is a data-driven watermark. It naturally
-        # waits for a delayed Watch stream without imposing a fixed delay.
-        target_time_s = min(
-            latest[source].timestamp_s + offsets[source]
-            for source in self.required_sources
-        )
-        matched = {}
-        for source in self.required_sources:
-            offset_s = offsets.get(source)
-            frames = buffers[source]
-            corrected_times = [frame.timestamp_s + offset_s for frame in frames]
-            frame = self._nearest_real_frame(
-                frames, corrected_times, target_time_s, offset_s
-            )
-            if abs(frame.timestamp_s - target_time_s) > self.stale_after_s:
-                return None, {}
-            matched[source] = frame
-        return target_time_s, matched
-
     def _collect_matched_window(
         self,
         start_time_s: float,
@@ -586,8 +546,7 @@ class AppleMocapSensor:
             time.sleep(0.02)
 
     def _raw_tensors(self):
-        _, frames = self._matched_frames()
-        now = time.monotonic()
+        now, _, offsets, latest = self._synchronization_snapshot()
         RIS = torch.eye(3).repeat(NUM_MODEL_SLOTS, 1, 1)
         aI = torch.zeros(NUM_MODEL_SLOTS, 3)
         gyroS = torch.zeros(NUM_MODEL_SLOTS, 3)
@@ -595,14 +554,15 @@ class AppleMocapSensor:
         valid = torch.zeros(NUM_MODEL_SLOTS, dtype=torch.bool)
 
         for source, slot in self.source_slots.items():
-            frame = frames.get(source)
-            if frame is None or now - frame.received_at_s > self.stale_after_s:
+            frame = latest.get(source)
+            offset_s = offsets.get(source)
+            if frame is None or offset_s is None:
                 continue
             RIS[slot] = frame.RIS
             aI[slot] = frame.RIS @ frame.aS
             gyroS[slot] = frame.gyroS
-            timestamps[slot] = frame.timestamp_s
-            valid[slot] = True
+            timestamps[slot] = frame.timestamp_s + offset_s
+            valid[slot] = now - frame.received_at_s <= self.stale_after_s
         return timestamps, aI, RIS, gyroS, valid
 
     def get(self):
@@ -615,10 +575,10 @@ class AppleMocapSensor:
         timestamps, aI, RIS, gyroS, valid = self._raw_tensors()
         aM = (self.RMI @ aI.unsqueeze(-1)).squeeze(-1)
         RMB = self.RMI @ RIS @ self.RSB
-        # PoseDataset encodes an unavailable IMU with zero acceleration and a
-        # zero orientation matrix.  Do not expose the identity initialization
-        # above as if it were a real, forward-facing sensor measurement.
-        RMB[~valid] = 0.0
+        # A stale slot still exposes its latest received sample for live
+        # inference. Only a slot with no sample/clock alignment is unavailable.
+        available = timestamps != 0
+        RMB[~available] = 0.0
         return timestamps, aM, RMB, gyroS, valid
 
     def npose_orientation_errors(self, RMB: torch.Tensor, valid: torch.Tensor):
@@ -684,9 +644,9 @@ class AppleMocapSensor:
             source: _project_rotation(torch.stack(RIS_samples[source]).mean(dim=0))
             for source in self.required_sources
         }
+        walk_start_time_s = time.time()
         beep()
         print("Step forward now.", flush=True)
-        walk_start_time_s = time.time()
         matched_samples, window_info = self._collect_matched_window(
             start_time_s=walk_start_time_s,
             duration_s=walk_duration_s,

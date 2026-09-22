@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import contextlib
 import json
+import pathlib
 import re
 import time
 from datetime import datetime, timezone
@@ -17,10 +19,9 @@ import torch
 from articulate.utils.unity import MotionViewer
 from articulate.utils.smpl_viewer import LightweightSMPLViewer
 from config import amass, model_config, paths
-from models.imu_calibrator import ComboTemporalIMUCalibrator, build_imu_input
+from models.chi2027_calibrator import build_model as build_chi2027_calibrator
 from models.tic_calibrator import TICOnlineCalibrator, TICOperatorConfig, TICTransformerCalibrator
 from sensor_apple import AppleIMUPlotter, AppleMocapSensor, MODALITIES
-from sensor_apple.sensor import beep
 from utils.model_utils import load_model
 
 
@@ -96,7 +97,12 @@ def save_sequence_package(
         "target_fps": args.fps,
         "measured_fps": measured_fps,
         "calibration_method": args.calibration,
-        "calibrator": args.calibrator,
+        "calibrator": (
+            "ours+nocalibration"
+            if args.compare_ours_nocalibration
+            else args.calibrator
+        ),
+        "compare_ours_nocalibration": args.compare_ours_nocalibration,
         "model": str(args.model.resolve()),
         "source_slots": dict(sensor.source_slots),
         "coordinate_frames": {
@@ -135,21 +141,72 @@ def choose_device(name: str) -> torch.device:
     return torch.device("cpu")
 
 
+class OnlineCHI2027Calibrator:
+    """Causal rolling-window adapter for a direct-rotation calibrator."""
+
+    def __init__(self, model, device: torch.device):
+        self.model = model
+        self.device = device
+        self.max_seq_len = model.max_seq_len
+        self.buffer = None
+
+    def reset(self) -> None:
+        self.buffer = None
+
+    @torch.inference_mode()
+    def forward_frame(self, frame: torch.Tensor) -> torch.Tensor:
+        frame = frame.to(self.device)
+        self.buffer = (
+            frame.unsqueeze(0)
+            if self.buffer is None
+            else torch.cat((self.buffer, frame.unsqueeze(0)), dim=0)
+        )
+        self.buffer = self.buffer[-self.max_seq_len :]
+        sequence = self.buffer.unsqueeze(0)
+        mask = torch.ones(
+            1, len(self.buffer), dtype=torch.bool, device=self.device
+        )
+        prediction, _ = self.model(sequence, mask)
+        return prediction[0, -1]
+
+
+def _load_portable_checkpoint(path: Path):
+    """Load checkpoints containing Linux PosixPath metadata on Windows."""
+    try:
+        return torch.load(path, map_location="cpu")
+    except NotImplementedError as error:
+        if "PosixPath" not in str(error):
+            raise
+        original_posix_path = pathlib.PosixPath
+        try:
+            pathlib.PosixPath = pathlib.WindowsPath
+            return torch.load(path, map_location="cpu")
+        finally:
+            pathlib.PosixPath = original_posix_path
+
+
+def _flatten_recurrent_parameters(module: torch.nn.Module) -> None:
+    """Restore cuDNN-friendly contiguous RNN weights after deepcopy."""
+    for child in module.modules():
+        flatten = getattr(child, "flatten_parameters", None)
+        if callable(flatten):
+            flatten()
+
+
 def load_combo_calibrator(path: Path, device: torch.device):
-    checkpoint = torch.load(path, map_location=device)
-    args = checkpoint.get("args", {})
-    model = ComboTemporalIMUCalibrator(
-        combo_size=len(CALIBRATOR_COMBO),
-        predict_acc=args.get("predict_acc", False),
-        hidden_dim=args.get("hidden_dim", 128),
-        dropout=args.get("dropout", 0.1),
-        num_layers=args.get("num_layers", 3),
-        nhead=args.get("nhead", 4),
-        max_seq_len=args.get("window_size", 125),
-    ).to(device)
+    checkpoint = _load_portable_checkpoint(path)
+    required = {"model_type", "model_kwargs", "model_state_dict"}
+    missing = required - set(checkpoint)
+    if missing:
+        raise ValueError(
+            f"Not a CHI 2027 calibrator checkpoint; missing {sorted(missing)}"
+        )
+    model = build_chi2027_calibrator(
+        checkpoint["model_type"], **checkpoint["model_kwargs"]
+    )
     model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval().reset()
-    return model
+    model = model.to(device).eval()
+    return OnlineCHI2027Calibrator(model, device)
 
 
 def load_tic_calibrator(path: Path, device: torch.device, buffer_size: int, trigger_t: float):
@@ -200,8 +257,14 @@ def arm_down_angles(model, pose: torch.Tensor):
 
 def apply_combo_calibrator(calibrator, aM, RMB):
     calibrated_RMB = RMB.clone()
-    frame = build_imu_input(aM.unsqueeze(0), RMB.unsqueeze(0))[0, CALIBRATOR_COMBO]
-    _, predicted_RMB = calibrator.forward_frame_windowed(frame)
+    frame = torch.cat(
+        (
+            aM[CALIBRATOR_COMBO] / amass.acc_scale,
+            RMB[CALIBRATOR_COMBO].flatten(-2),
+        ),
+        dim=-1,
+    )
+    predicted_RMB = calibrator.forward_frame(frame)
     calibrated_RMB[CALIBRATOR_COMBO] = predicted_RMB
     return aM, calibrated_RMB
 
@@ -243,10 +306,10 @@ def parse_args():
     parser.add_argument(
         "--fps",
         type=float,
-        default=25.0,
+        default=30.0,
         help="live inference rate; model timing remains calibrated at 30 Hz",
     )
-    parser.add_argument("--stale-after", type=float, default=0.5)
+    parser.add_argument("--stale-after", type=float, default=1.0)
     parser.add_argument(
         "--calibration-wait-timeout",
         type=float,
@@ -256,7 +319,20 @@ def parse_args():
     )
     parser.add_argument("--ready-timeout", type=float, default=30.0)
     parser.add_argument("--calibration", choices=("npose", "walking_6dof", "none"), default="walking_6dof")
-    parser.add_argument("--calibrator", choices=("none", "ours", "tic"), default="none")
+    parser.add_argument(
+        "--calibrator",
+        choices=("none", "nocalibration", "plain", "ours", "tic"),
+        default="none",
+        help=(
+            "rotation calibrator; none/nocalibration bypass calibration, "
+            "ours and plain use the CHI 2027 checkpoints"
+        ),
+    )
+    parser.add_argument(
+        "--compare-ours-nocalibration",
+        action="store_true",
+        help="run independent ours and no-calibration MobilePoser branches together",
+    )
     parser.add_argument(
         "--visualize-sensor",
         choices=("apple_watch", "iphone", "airpods"),
@@ -289,6 +365,20 @@ def parse_args():
         help="maximum skeleton viewer refresh rate",
     )
     parser.add_argument(
+        "--viewer-width",
+        type=int,
+        default=640,
+        metavar="PIXELS",
+        help="skeleton viewer width (default: 640)",
+    )
+    parser.add_argument(
+        "--viewer-height",
+        type=int,
+        default=640,
+        metavar="PIXELS",
+        help="skeleton viewer height (default: 640)",
+    )
+    parser.add_argument(
         "--no-viewer",
         action="store_true",
         help="deprecated alias for --viewer none",
@@ -319,7 +409,7 @@ def parse_args():
         help="deprecated alias for --name",
     )
     parser.add_argument(
-        "--subject", type=_safe_sequence_name, default="xinlong_0902",
+        "--subject", type=_safe_sequence_name, default="yatong_0904",
         help="dataset subject folder; required with --name/--sequence-name",
     )
     parser.add_argument("--action", default=None, help="optional action label")
@@ -329,7 +419,14 @@ def parse_args():
     parser.add_argument(
         "--ours-calibrator",
         type=Path,
-        default=BASE_DIR / "data/checkpoints/combo_imu_calibrator_lw_rp_h_ori_only_jerk_nopose_fulltrain_tb_noncausal/best.pt",
+        default=BASE_DIR / "data/checkpoints/chi2027_calibrator_ours/best.pt",
+        help="CHI 2027 cross-device calibrator checkpoint",
+    )
+    parser.add_argument(
+        "--plain-calibrator",
+        type=Path,
+        default=BASE_DIR / "data/checkpoints/chi2027_calibrator_plain/best.pt",
+        help="CHI 2027 causal Plain Transformer checkpoint",
     )
     parser.add_argument(
         "--tic-calibrator",
@@ -351,12 +448,20 @@ def parse_args():
 def main():
     args = parse_args()
     args.sequence_name = args.name or args.sequence_name
+    if args.calibrator == "nocalibration":
+        args.calibrator = "none"
+    if args.compare_ours_nocalibration and args.calibrator not in {"none", "ours"}:
+        raise SystemExit(
+            "--compare-ours-nocalibration cannot be combined with plain or tic"
+        )
     if args.viewer == "lightweight":
         args.viewer = "skeleton"
     if args.fps <= 0:
         raise SystemExit("--fps must be positive")
     if args.viewer_fps <= 0:
         raise SystemExit("--viewer-fps must be positive")
+    if args.viewer_width <= 0 or args.viewer_height <= 0:
+        raise SystemExit("--viewer-width and --viewer-height must be positive")
     if args.calibration_wait_timeout <= 0:
         raise SystemExit("--calibration-wait-timeout must be positive")
     if args.no_viewer:
@@ -383,22 +488,59 @@ def main():
     print(f"Inference device: {device}")
 
     model = load_model(str(args.model)).to(device).eval()
+    nocalibration_model = None
     calibrator = None
-    if args.calibrator == "ours":
+    if args.compare_ours_nocalibration:
+        nocalibration_model = copy.deepcopy(model).eval()
+        _flatten_recurrent_parameters(model)
+        _flatten_recurrent_parameters(nocalibration_model)
         calibrator = load_combo_calibrator(args.ours_calibrator, device)
+        print(
+            "Comparison mode: CHI 2027 ours + nocalibration; "
+            f"checkpoint={args.ours_calibrator}"
+        )
+    elif args.calibrator == "plain":
+        calibrator = load_combo_calibrator(args.plain_calibrator, device)
+        print(
+            "Loaded CHI 2027 Plain Transformer calibrator: "
+            f"{args.plain_calibrator}"
+        )
+    elif args.calibrator == "ours":
+        calibrator = load_combo_calibrator(args.ours_calibrator, device)
+        print(f"Loaded CHI 2027 ours calibrator: {args.ours_calibrator}")
     elif args.calibrator == "tic":
         calibrator = load_tic_calibrator(
             args.tic_calibrator, device, args.tic_buffer_size, args.tic_trigger_t
         )
 
     records = {"timestamp": [], "acc": [], "ori": [], "gyro": [], "pose": [], "valid": []}
+    if args.compare_ours_nocalibration:
+        records.update(
+            {
+                "ori_nocalibration": [],
+                "pose_nocalibration": [],
+                "pose_ours": [],
+            }
+        )
     if args.viewer == "skeleton":
         viewer_context = LightweightSMPLViewer(
             model_path=paths.smpl_file,
             fps=args.viewer_fps,
+            width=args.viewer_width,
+            height=args.viewer_height,
+            title=(
+                "Apple Mocap — Calibration (comparison)"
+                if args.compare_ours_nocalibration
+                else "Apple Mocap — Skeleton Preview"
+            ),
         )
     elif args.viewer == "unity":
-        viewer_context = MotionViewer(1, overlap=False, names=["Apple IMU"])
+        if args.compare_ours_nocalibration:
+            viewer_context = MotionViewer(
+                2, overlap=False, names=["NoCalibration", "Calibration"]
+            )
+        else:
+            viewer_context = MotionViewer(1, overlap=False, names=["Apple IMU"])
     else:
         viewer_context = contextlib.nullcontext(None)
 
@@ -411,21 +553,30 @@ def main():
     ) as sensor:
         print(f"Listening for Sensor Read at udp://{args.host}:{args.port}")
         print(f"Source mapping: {sensor.source_slots}")
-        print("Timestamp matching: slowest-stream watermark, native samples only (no interpolation)")
+        print("Live input: latest clock-aligned sample from each device")
         sensor.wait_until_ready(timeout_s=args.ready_timeout)
         if args.visualize_sensor and args.visualize_sensor not in sensor.source_slots:
             raise RuntimeError(
                 f"Visualization source {args.visualize_sensor!r} is not configured; "
                 f"available sources: {', '.join(sensor.required_sources)}"
             )
-        if args.calibrator != "none" and set(CALIBRATOR_COMBO) - set(sensor.source_slots.values()):
+        if (
+            (args.calibrator != "none" or args.compare_ours_nocalibration)
+            and set(CALIBRATOR_COMBO) - set(sensor.source_slots.values())
+        ):
+            calibrator_name = (
+                "ours" if args.compare_ours_nocalibration else args.calibrator
+            )
             raise RuntimeError(
-                f"{args.calibrator} calibrator requires MobilePoser slots {CALIBRATOR_COMBO}"
+                f"{calibrator_name} calibrator requires MobilePoser slots "
+                f"{CALIBRATOR_COMBO}"
             )
         if args.calibration == "npose":
             sensor.calibrate_npose()
         elif args.calibration == "walking_6dof":
             sensor.calibrate_walking_6dof()
+        frozen_offsets = sensor.freeze_clock_offsets()
+        print(f"Frozen clock offsets: {frozen_offsets}", flush=True)
 
         plotter_context = (
             AppleIMUPlotter(
@@ -453,10 +604,7 @@ def main():
                 contextlib.ExitStack() as viewer_stack,
             ):
                 if args.sequence_name:
-                    frozen_offsets = sensor.freeze_clock_offsets()
-                    print(f"Frozen clock offsets: {frozen_offsets}", flush=True)
                     sequence_start_timestamp_s = time.time()
-                    beep()
                     print(
                         "Calibration complete; sequence recording starts now. "
                         "Tap End Collection in "
@@ -466,6 +614,10 @@ def main():
                 # Entering this context creates and raises the local window.
                 viewer = viewer_stack.enter_context(viewer_context)
                 model.reset()
+                if nocalibration_model is not None:
+                    nocalibration_model.reset()
+                if isinstance(calibrator, OnlineCHI2027Calibrator):
+                    calibrator.reset()
                 clock = pygame.time.Clock()
                 started = time.monotonic()
                 next_debug_time = started
@@ -484,7 +636,6 @@ def main():
                         sequence_stop_state = recording_end
                         sequence_completed = bool(args.sequence_name)
                         ordinary_completed = not args.sequence_name
-                        beep()
                         print(
                             "\nAccepted Sensor Read stop signal received "
                             f"({recording_end.get('event_type')}); saving is authorized.",
@@ -503,16 +654,24 @@ def main():
                     timestamp, aM, RMB, gyroS, valid = sensor.get()
                     required_slots = sorted(sensor.source_slots.values())
                     required_valid = valid[required_slots]
-                    if not bool(required_valid.all()):
-                        missing = [required_slots[i] for i, value in enumerate(required_valid) if not value]
-                        print(f"\rStale Apple IMU slot(s): {missing}", end="", flush=True)
-                        continue
+                    missing = [
+                        required_slots[i]
+                        for i, value in enumerate(required_valid)
+                        if not value
+                    ]
+                    # if missing:
+                    #     print(
+                    #         f"\rStale Apple IMU slot(s): {missing}; using latest samples",
+                    #         end="",
+                    #         flush=True,
+                    #     )
 
-                    # Use the oldest selected native sample as a conservative
-                    # physical boundary: all three devices must cross it.
+                    # Use the oldest latest-sample time as the initial physical
+                    # boundary; live inference itself does not require a shared
+                    # per-frame watermark after this point.
                     frame_timestamp_s = float(timestamp[required_slots].min().item())
-                    # The adaptive watermark may still be just before the start
-                    # keypress while a delayed Watch batch is catching up.
+                    # One device's latest sample may still precede the start
+                    # keypress while its next native batch is arriving.
                     if (
                         args.sequence_name
                         and frame_timestamp_s < sequence_start_timestamp_s
@@ -526,7 +685,16 @@ def main():
 
                     aM = aM.to(device)
                     RMB = RMB.to(device)
-                    if args.calibrator == "ours":
+                    pose_nocalibration = None
+                    RMB_nocalibration = None
+                    if args.compare_ours_nocalibration:
+                        RMB_nocalibration = RMB.clone()
+                        nocalibration_input = make_mocap_input(aM, RMB, device)
+                        pose_nocalibration = nocalibration_model.forward_frame(
+                            nocalibration_input
+                        ).view(24, 3, 3)
+                        aM, RMB = apply_combo_calibrator(calibrator, aM, RMB)
+                    elif args.calibrator in {"plain", "ours"}:
                         aM, RMB = apply_combo_calibrator(calibrator, aM, RMB)
                     elif args.calibrator == "tic":
                         aM, RMB = apply_tic_calibrator(calibrator, aM, RMB)
@@ -554,6 +722,15 @@ def main():
                     if viewer is not None:
                         if args.viewer == "skeleton":
                             viewer.update(pose_cpu)
+                        elif args.compare_ours_nocalibration:
+                            viewer.update_all(
+                                [
+                                    pose_nocalibration.detach().cpu().numpy(),
+                                    pose_cpu.numpy(),
+                                ],
+                                [np.zeros(3), np.zeros(3)],
+                                render=True,
+                            )
                         else:
                             viewer.update_all([pose_cpu.numpy()], [np.zeros(3)], render=True)
 
@@ -564,7 +741,15 @@ def main():
                         records["gyro"].append(gyroS.clone())
                         records["pose"].append(pose_cpu)
                         records["valid"].append(valid.clone())
-                    print(f"\rFPS: {clock.get_fps():.1f}", end="", flush=True)
+                        if args.compare_ours_nocalibration:
+                            records["ori_nocalibration"].append(
+                                RMB_nocalibration.detach().cpu()
+                            )
+                            records["pose_nocalibration"].append(
+                                pose_nocalibration.detach().cpu()
+                            )
+                            records["pose_ours"].append(pose_cpu.clone())
+                    print(f"\rFPS: {clock.get_fps():.2f}", end="", flush=True)
                 if args.sequence_name and sequence_completed:
                     print("\nSequence recording complete.", flush=True)
         except KeyboardInterrupt:

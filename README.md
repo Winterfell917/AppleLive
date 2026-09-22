@@ -78,6 +78,10 @@ python livedemo.py --mocap --compare-all
 ```text
 mobileposer/data/checkpoints/
 ├── base_model_12combo.pth
+├── chi2027_calibrator_ours/
+│   └── best.pt
+├── chi2027_calibrator_plain/
+│   └── best.pt
 ├── combo_imu_calibrator_lw_rp_h_ori_only_jerk_nopose_fulltrain_tb_noncausal/
 │   └── best.pt
 └── tic_calibrator_amass_full/

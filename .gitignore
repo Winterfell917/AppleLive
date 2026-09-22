@@ -7,6 +7,7 @@ checkpoints/
 .vscode/
 __pycache__/
 backup/
+mobileposer/3rd_party/
 
 # Distribution / packaging
 .Python
@@ -58,6 +59,12 @@ mobileposer/data/*
 !mobileposer/data/checkpoints/
 mobileposer/data/checkpoints/*
 !mobileposer/data/checkpoints/base_model_12combo.pth
+!mobileposer/data/checkpoints/chi2027_calibrator_ours/
+mobileposer/data/checkpoints/chi2027_calibrator_ours/*
+!mobileposer/data/checkpoints/chi2027_calibrator_ours/best.pt
+!mobileposer/data/checkpoints/chi2027_calibrator_plain/
+mobileposer/data/checkpoints/chi2027_calibrator_plain/*
+!mobileposer/data/checkpoints/chi2027_calibrator_plain/best.pt
 !mobileposer/data/checkpoints/combo_imu_calibrator_lw_rp_h_ori_only_jerk_nopose_fulltrain_tb_noncausal/
 mobileposer/data/checkpoints/combo_imu_calibrator_lw_rp_h_ori_only_jerk_nopose_fulltrain_tb_noncausal/*
 !mobileposer/data/checkpoints/combo_imu_calibrator_lw_rp_h_ori_only_jerk_nopose_fulltrain_tb_noncausal/best.pt
