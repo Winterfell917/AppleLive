@@ -43,6 +43,19 @@ def _project_joints(
     ).round().astype(np.int32)
 
 
+def _load_label_font(pygame, size: int = 22):
+    """Load a UI font without requiring a clean Windows font registry.
+
+    ``pygame.font.SysFont`` enumerates every value under the Fonts registry
+    key and crashes when one of them is not a file path. The built-in font
+    does not read that key.
+    """
+    try:
+        return pygame.font.SysFont("Arial", size)
+    except (TypeError, OSError, pygame.error):
+        return pygame.font.Font(None, size)
+
+
 def _center_window(pygame, width: int, height: int) -> None:
     """Set the SDL position before creating a window on the primary display."""
     try:
@@ -78,6 +91,7 @@ def _viewer_process(frame_queue, status_queue, model_path, title, width, height)
             height - 16,
             round(height * 0.5 - scale * (float(zero_y.min()) - vertical_center) + 12),
         )
+        font = _load_label_font(pygame, 22)
         status_queue.put(("ready", None))
 
         background = (246, 248, 251)
@@ -85,7 +99,6 @@ def _viewer_process(frame_queue, status_queue, model_path, title, width, height)
         joint_color = (16, 65, 115)
         text_color = (35, 42, 50)
         floor_color = (205, 211, 219)
-        font = pygame.font.SysFont("Arial", 22)
         clock = pygame.time.Clock()
         fps_started_s = time.monotonic()
         rendered_frames = 0
