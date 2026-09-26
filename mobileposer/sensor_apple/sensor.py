@@ -38,10 +38,12 @@ def beep(frequency=440, duration_ms=600) -> None:
 
 # MobilePoser slot order: left wrist, right wrist, left thigh, right thigh,
 # head, left foot, right foot.
+# AirPods is optional. Leave it out of the default so startup and calibration
+# do not block when no headphone stream is present; the head slot stays zero.
+# Opt in with --source-slot apple_watch:0 --source-slot iphone:3 --source-slot airpods:4.
 DEFAULT_SOURCE_SLOTS = {
     "apple_watch": 0,
     "iphone": 3,
-    "airpods": 4,
 }
 
 SOURCE_ALIASES = {

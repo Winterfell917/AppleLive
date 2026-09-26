@@ -4,20 +4,23 @@ This integration consumes the UDP JSON protocol produced by the sibling
 `sensor_read` iOS/watchOS project and sends Apple Watch, iPhone, and AirPods
 motion data into MobilePoser.
 
-Default device mapping:
+Default device mapping is Watch + iPhone. Startup and calibration do not wait
+for AirPods; the unconfigured head slot stays zero. Add AirPods explicitly with
+`--source-slot airpods:4` (together with the Watch and iPhone mappings, because
+`--source-slot` replaces the whole mapping).
 
-| Sensor Read source | MobilePoser location | Slot |
-| --- | --- | ---: |
-| `apple_watch` | left wrist | 0 |
-| `iphone` | right pocket/thigh | 3 |
-| `airpods` | head | 4 |
+| Sensor Read source | MobilePoser location | Slot | Default |
+| --- | --- | ---: | --- |
+| `apple_watch` | left wrist | 0 | required |
+| `iphone` | right pocket/thigh | 3 | required |
+| `airpods` | head | 4 | optional |
 
 ## Run
 
 1. Put the Mac and iPhone on the same LAN.
 2. In Sensor Read, set the destination to the Mac's LAN IP and UDP port 9000.
-3. Wear the Watch on the left wrist, put the iPhone in the right pocket, and
-   connect compatible AirPods.
+3. Wear the Watch on the left wrist and put the iPhone in the right pocket.
+   AirPods are optional and are not waited on unless mapped with `--source-slot`.
 4. From the `mobileposer` directory, activate the `mobileposer` Conda env.
 5. Start Sensor Read collection, then run:
 

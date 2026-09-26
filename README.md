@@ -30,27 +30,33 @@ cd mobileposer
 
 ### 设备和槽位
 
-Sensor Read 的默认设备映射为：
+Sensor Read 的默认设备映射为 Watch + iPhone。运行时不会等待 AirPods；
+未配置的头部槽位以零值填入。
 
-| 数据源 | 身体位置 | 模型槽位 |
-| --- | --- | ---: |
-| Apple Watch | 左腕 | 0 |
-| iPhone | 右口袋/右大腿 | 3 |
-| AirPods | 头部 | 4 |
+| 数据源 | 身体位置 | 模型槽位 | 默认 |
+| --- | --- | ---: | --- |
+| Apple Watch | 左腕 | 0 | 必选 |
+| iPhone | 右口袋/右大腿 | 3 | 必选 |
+| AirPods | 头部 | 4 | 可选 |
 
-项目支持只使用 Apple Watch 和 iPhone。两设备模式使用：
+默认命令只等待 Watch 和 iPhone：
+
+```bash
+python livedemo_apple.py --no-viewer --duration 20
+```
+
+需要耳机时显式加入头部槽位：
 
 ```bash
 python livedemo_apple.py \
   --source-slot apple_watch:0 \
   --source-slot iphone:3 \
-  --calibrator nocalibration
+  --source-slot airpods:4
 ```
 
-未配置的 AirPods/头部槽位会以零值填入 MobilePoser 的固定五槽输入，因此可以
-完成实时推理，但精度和稳定性通常低于 Watch + iPhone + AirPods 三设备配置。
-两设备模式只支持 `none`/`nocalibration`；`ours`、`plain`、`tic` 以及
-`--compare-ours-nocalibration` 均要求槽位 0、3、4 同时存在。
+无耳机时可以完成实时推理，但精度和稳定性通常低于 Watch + iPhone + AirPods
+三设备配置。两设备模式只支持 `none`/`nocalibration`；`ours`、`plain`、`tic`
+以及 `--compare-ours-nocalibration` 均要求槽位 0、3、4 同时存在。
 
 这里的 `nocalibration` 只表示不使用学习式在线 calibrator，默认的
 `walking_6dof` 物理坐标校准仍会执行。如需连物理校准也跳过，请额外传入
