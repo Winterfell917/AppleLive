@@ -144,6 +144,52 @@ python livedemo_apple.py --subject libo1_0901 --name 001
 
 详见 [Apple 接入说明](mobileposer/APPLE_MOCAP.md)。
 
+### 训练数据：Watch 本地记录模式
+
+训练采集默认不再等待 Watch 实时 UDP。iPhone 和 Apple Watch 在每条 take 中
+分别本地记录；标定阶段 iPhone 同时通过 UDP 发送 `device_motion`，让电脑在正式
+动作前立即检查标定。标定通过后关闭 iPhone UDP，但两台设备继续本地记录；结束后
+Watch 将完整文件传给手机。先运行一次试采：
+
+```bash
+python collect_train_sequence.py --once \
+  --action Walking --watch lw --phone-pocket lp \
+  --group 1 --phone-facing screen_in
+```
+
+脚本负责提示 N-pose、向前走和正式动作的时间窗口，并先生成 `capture.json`。
+开始每条采集前，将手机 UDP 地址设置为电脑局域网 IP、端口 `9000`，打开 UDP
+实时传输。脚本只等待 iPhone，不等待 Watch；标定失败会立即要求重做，成功后会
+提示关闭手机 UDP，再开始正式动作。`--host`/`--port` 可修改电脑监听地址和端口。
+每条结束后，它会显示该条专属的电脑收件箱；等 Watch 文件完整传到手机后，
+通过 USB 将 iPhone 和 Watch 的 NDJSON 复制进该目录，然后回到终端按回车。
+脚本会自动识别两份文件、生成 `labels.pt`，成功后才进入下一条。
+整理时只使用 iPhone 的 N-pose 检查和向前走数据计算 `R_MI`；Apple Watch
+不单独标定，直接使用同一个 iPhone `R_MI`。iPhone 标定失败时，该 attempt
+会记录失败原因，脚本要求重新标定，不会开始正式动作。文件导入时还会使用本地
+iPhone 文件和成功标定窗口重新校验一次，避免 UDP 丢包或时间偏差造成误判。
+
+`labels.pt` 保存设备顺序、文字槽位、整数 `model_slots` 槽位真值，以及 30 FPS
+模型坐标系序列：`orientation = R_MI @ RIS`、
+`acceleration = R_MI @ RIS @ aS`。同时保存 `motion_valid` 新鲜度掩码；不再保存
+`R_SB`、`R_MB`、原始 `aS`/`RIS` 或 UWB 序列。共享的 `R_MI` 及手机标定质量
+记录在 `meta.json` 中。
+
+可以用 `--inbox D:/MocapInbox` 更改收件箱根目录。如果本次只想采集、稍后统一
+整理，添加 `--defer-import`。之后手动执行：
+
+```bash
+python collect_train_sequence.py \
+  --finalize data/datasets/train_labels/_trial/<试采目录> \
+  --iphone-file D:/raw/iphone.ndjson \
+  --watch-file D:/raw/watch.ndjson
+```
+
+成功后目录中会生成 `labels.pt`、`meta.json`、`quality.json` 和合并后的
+`raw.ndjson`。如果设备文件时间与电脑标记窗口存在固定偏差，可分别使用
+`--iphone-time-offset` 和 `--watch-time-offset`（秒）修正。旧版双设备实时 UDP
+流程仍可通过 `--legacy-live` 显式启用。
+
 ## 华为设备动作捕捉
 
 启动传感器发送端和 Unity MotionViewer 后运行：

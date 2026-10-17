@@ -198,6 +198,7 @@ class SensorReadReceiver:
             if sequence_number >= 0:
                 self._latest_sequence[key] = sequence_number
             received_mono = time.monotonic()
+            received_unix_s = time.time()
             timestamp_s = float(timestamp_ns) / 1_000_000_000.0
             if sensor == "uwb_ranging":
                 distance = values.get("distance_m")
@@ -218,9 +219,15 @@ class SensorReadReceiver:
                 return
             self._motion[source].append(
                 {
+                    "source": source,
+                    "sensor": sensor,
+                    "session_id": str(event.get("sessionID", "")),
                     "sequence": sequence_number,
+                    "timestamp_unix_ns": int(timestamp_ns),
                     "timestamp_s": timestamp_s,
                     "received_mono": received_mono,
+                    "received_unix_s": received_unix_s,
+                    "raw_values": dict(values),
                     "aS": acceleration_s,
                     "RIS": ris,
                     "aI": acceleration_i,
@@ -239,6 +246,20 @@ class SensorReadReceiver:
                 dict(sample)
                 for sample in self._motion[source]
                 if sample["received_mono"] >= received_after
+            ]
+
+    def motion_between(
+        self,
+        source: str,
+        received_after: float,
+        received_before: float,
+    ) -> list[dict]:
+        """Return the exact UDP samples received inside a monotonic-time window."""
+        with self._lock:
+            return [
+                dict(sample)
+                for sample in self._motion[source]
+                if received_after <= sample["received_mono"] <= received_before
             ]
 
     def uwb_between(self, received_after: float, received_before: float) -> list[dict]:
