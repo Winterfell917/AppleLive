@@ -4,7 +4,8 @@ Default protocol:
     subject: p02
     fixed placement: left Watch wrist + left trouser pocket
     fixed phone facing: screen inward, phone head down
-    room-relative body yaw: 0, 90, 180, 270 degrees
+    calibration always faces the fixed physical room 0-degree reference
+    action body yaw: 0, 90, 180, 270 degrees relative to that reference
     actions at every yaw: Boxing, Waving, Walking (control)
     calibration: the existing iPhone-only calibration is repeated per sequence
 
@@ -26,7 +27,7 @@ import collect_train_sequence as train
 DEFAULT_ACTIONS = ("Boxing", "Waving", "Walking")
 DEFAULT_DIRECTIONS = (0, 90, 180, 270)
 DEFAULT_SUBJECT = "p02"
-PROTOCOL_ID = "orientation_sensitivity_retest_v1"
+PROTOCOL_ID = "orientation_sensitivity_retest_v2_fixed_calibration_reference"
 
 
 def parse_args() -> argparse.Namespace:
@@ -118,12 +119,18 @@ def make_experiment(args: argparse.Namespace, direction: int, action: str) -> di
     return {
         "protocol_id": PROTOCOL_ID,
         "purpose": "controlled_retest_of_room_orientation_sensitivity",
+        # Kept for compatibility with v1 readers.  The explicit fields below
+        # are authoritative and distinguish calibration from formal action.
         "room_body_yaw_deg": direction,
+        "calibration_room_yaw_deg": 0,
+        "action_room_yaw_deg": direction,
         "room_zero_note": args.room_zero_note,
         "yaw_convention": args.yaw_convention,
         "action_role": "stable_control" if action == "Walking" else "orientation_focus",
         "recalibrated_before_action": True,
-        "calibration_policy": "repeat existing iPhone N-pose and forward-walk calibration for every sequence; Watch reuses iPhone R_MI",
+        "calibration_policy": "repeat iPhone N-pose and forward-walk calibration for every sequence while facing the fixed physical room 0-degree reference; only after calibration passes, turn to action_room_yaw_deg for the formal action; Watch reuses iPhone R_MI",
+        "calibration_instruction": "本协议规定：标定阶段始终面向房间固定的 0° 基准方向；不要按本条动作方向转身。N-pose 和随后向前走均沿 0° 方向完成。",
+        "post_calibration_instruction": f"标定方向固定为房间 0°。现在转身面向本条正式动作方向 {direction}°，回到动作起点；不要重新标定。",
         "fixed_conditions": {
             "watch": args.watch,
             "watch_slot": watch["slot"],
@@ -172,11 +179,18 @@ def retest_prompt(take: dict, index: int, total: int) -> str:
     pocket = train.POCKET_INFO[take["phone_pocket"]]
     facing = train.FACING_LABEL[take["phone_facing"]]
     role = "稳定对照" if take["experiment"]["action_role"] == "stable_control" else "重点动作"
+    calibration_instruction = (
+        "标定阶段始终面向房间固定的 0° 基准方向；N-pose 和标定向前走均沿 0° 完成。\n"
+    )
+    action_instruction = (
+        f"iPhone 标定成功后，再转身面向相对房间 0° 的 {direction}°方向完成正式动作。\n"
+    )
     return (
         f"\n[{index}/{total}] 房间朝向 {direction}°，{take['action']}"
         f"（{train.ACTION_LABEL[take['action']]}，{role}）\n"
-        f"身体面向相对房间0°的 {direction}°方向；标定走路和正式动作都保持该方向。\n"
-        f"手表固定在{watch['label']}（{take['watch']}），手机固定在{pocket['label']}"
+        + calibration_instruction
+        + action_instruction
+        + f"手表固定在{watch['label']}（{take['watch']}），手机固定在{pocket['label']}"
         f"（{take['phone_pocket']}），{facing}（{take['phone_facing']}）。\n"
         "本条会按原流程重新标定；不要更换设备、手腕、口袋或手机朝向。"
     )
@@ -188,7 +202,7 @@ def protocol_document(args: argparse.Namespace, plan: list[dict]) -> dict:
         "protocol_id": PROTOCOL_ID,
         "subject": args.subject,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "purpose": "检验朝向敏感性在受控复测中是否稳定复现",
+        "purpose": "检验在固定物理标定参考下，正式动作朝向变化的敏感性是否稳定复现",
         "room_directions_deg": normalize_directions(args.room_directions),
         "room_zero_note": args.room_zero_note,
         "yaw_convention": args.yaw_convention,
@@ -198,6 +212,8 @@ def protocol_document(args: argparse.Namespace, plan: list[dict]) -> dict:
         "fixed_conditions": plan[0]["experiment"]["fixed_conditions"],
         "calibration": {
             "recalibrated_before_every_action": True,
+            "calibration_room_yaw_deg": 0,
+            "calibration_reference_rule": "每条的 N-pose 和向前走均面向同一物理房间 0° 方向；标定通过后才转向本条 action_room_yaw_deg。",
             "policy": plan[0]["experiment"]["calibration_policy"],
         },
         "sequence_count": len(plan),
@@ -230,13 +246,15 @@ def run_self_test(args: argparse.Namespace) -> None:
     if len(plan) != expected:
         raise AssertionError(f"计划应为 {expected} 条，实际 {len(plan)} 条")
     identities = {
-        (take["experiment"]["room_body_yaw_deg"], take["action"])
+        (take["experiment"]["action_room_yaw_deg"], take["action"])
         for take in plan
     }
     if len(identities) != expected:
         raise AssertionError("计划中存在重复的房间朝向/动作组合")
     if not all(take["experiment"]["recalibrated_before_action"] for take in plan):
         raise AssertionError("每条都必须记录为重新标定")
+    if not all(take["experiment"]["calibration_room_yaw_deg"] == 0 for take in plan):
+        raise AssertionError("每条标定必须使用固定的房间 0° 参考方向")
     print(f"self-test passed：{len(plan)} 条唯一的房间朝向 × 动作组合")
 
 
@@ -274,7 +292,7 @@ def main() -> None:
     print(f"房间0°参照：{args.room_zero_note}")
     print(f"角度约定：{args.yaw_convention}")
     print("请先在地面或房间参照物上明确标出0°、90°、180°、270°。")
-    print("标定向前走与正式动作必须面向本条指定方向。")
+    print("重要约定：每条的 N-pose 和标定向前走始终面向房间 0°；标定成功后才转身面向本条指定动作方向。")
     if args.defer_import:
         print("默认批量模式：全部录完后把手机文件一次复制到原始文件目录，再统一整理。")
     else:
@@ -286,7 +304,7 @@ def main() -> None:
         direction = int(take["experiment"]["room_body_yaw_deg"])
         if direction != previous_direction:
             print(
-                f"\n下一阶段：身体及标定走路方向切换到房间 {direction}°。"
+                f"\n下一阶段：正式动作方向切换到房间 {direction}°；标定方向仍固定为房间 0°。"
                 "设备佩戴和手机朝向保持不变。",
                 flush=True,
             )
