@@ -329,6 +329,11 @@ def calibrate_once(
     walk_s: float,
     phone_pocket: str,
 ) -> dict[str, dict] | None:
+    print(
+        "标定要求：戴手表的一侧手臂全程保持固定；前走时不要摆臂或旋转手腕，"
+        "尽量让手表相对身体保持同一姿态。",
+        flush=True,
+    )
     input("站成 N-pose，面向前方，按回车。保持不动，听到提示音后再向前走。")
     print(f"保持不动 {npose_s:.0f} 秒。", flush=True)
     npose_started = time.monotonic()

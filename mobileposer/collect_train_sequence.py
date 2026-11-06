@@ -1,7 +1,7 @@
 """Record and finalize training sequences from Sensor Read device-local files.
 
-Nine actions, four wears (watch left/right wrist × phone left/right pocket),
-three groups per wear, and two pocket facings per group: 9 × 4 × 3 × 2 = 216.
+Ten actions, four wears (watch left/right wrist × phone left/right pocket),
+three groups per wear, and two pocket facings per group: 10 × 4 × 3 × 2 = 240.
 Each take records timed N-pose, forward-walk, and action windows.  The iPhone and
 Apple Watch write their own files during capture; no live Watch stream is
 required.  The iPhone additionally streams device_motion over UDP only while
@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import copy
 import json
 import statistics
 import time
@@ -57,6 +58,7 @@ ACTIONS = (
     "JumpingJacks",
     "Boxing",
     "Waving",
+    "Standing",
 )
 ACTION_LABEL = {
     "Walking": "走路",
@@ -68,6 +70,7 @@ ACTION_LABEL = {
     "JumpingJacks": "开合跳",
     "Boxing": "拳击",
     "Waving": "挥手",
+    "Standing": "站立",
 }
 ACTION_CUE = {
     "Walking": "向前走",
@@ -79,6 +82,7 @@ ACTION_CUE = {
     "JumpingJacks": "开合跳",
     "Boxing": "出拳",
     "Waving": "挥手",
+    "Standing": "保持站立",
 }
 WATCHES = ("lw", "rw")
 POCKETS = ("lp", "rp")
@@ -103,6 +107,7 @@ LIVE_CALIBRATION_FILENAME = "live_iphone_calibration.ndjson"
 OFFLINE_CAPTURE_SCHEMA_VERSION = 2
 DEFAULT_INBOX_DIR = Path(__file__).resolve().parent / "data" / "device_inbox"
 DEFAULT_RAW_ROOT = Path(__file__).resolve().parent / "data" / "datasets" / "train"
+DEFAULT_LABEL_ROOT = Path(__file__).resolve().parent / "data" / "datasets" / "train_labels"
 MAX_NPOSE_ORIENTATION_DEG = 12.0
 MAX_NPOSE_ACCEL_RMS_M_S2 = 1.5
 MIN_FORWARD_DISTANCE_M = 0.02
@@ -128,17 +133,17 @@ def calibration_success_beep() -> None:
 
 
 def collection_plan() -> list[dict]:
-    """Fix one wear, finish every action, then move the devices.
+    """Fix one wear and phone facing, then finish every action and group.
 
-    Inside one action and wear: group 1..3, and each group is screen_in
-    then screen_out. Both facings keep the phone head down.
+    For each wear, finish screen_in before screen_out. Both facings keep
+    the phone head down.
     """
     plan = []
     for watch in WATCHES:
         for pocket in POCKETS:
-            for action in ACTIONS:
-                for group in GROUPS:
-                    for facing in FACINGS:
+            for facing in FACINGS:
+                for action in ACTIONS:
+                    for group in GROUPS:
                         plan.append(
                             {
                                 "action": action,
@@ -149,6 +154,34 @@ def collection_plan() -> list[dict]:
                             }
                         )
     return plan
+
+
+def subject_id(value: str) -> str:
+    """Validate a short, filesystem-safe participant identifier."""
+    if not value or not value.isascii() or not value[0].isalnum() or any(
+        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+        for character in value
+    ):
+        raise argparse.ArgumentTypeError(
+            "受试者编号只能包含英文字母、数字、下划线和连字符，且必须以字母或数字开头"
+        )
+    return value.lower()
+
+
+def subject_paths(args: argparse.Namespace) -> Path:
+    """Keep another participant's labels and imported files outside legacy roots."""
+    if args.subject is None:
+        args.raw_root = args.raw_root or DEFAULT_RAW_ROOT
+        args.inbox = args.inbox or DEFAULT_INBOX_DIR
+        return args.output or DEFAULT_LABEL_ROOT
+
+    base = DEFAULT_LABEL_ROOT.parent / "subjects" / args.subject
+    args.raw_root = args.raw_root or base / "train_raw"
+    args.inbox = args.inbox or base / "device_inbox"
+    if args.output is not None:
+        output = args.output.resolve()
+        return output.with_name(f"{output.name}_{args.subject}")
+    return base / "train_labels"
 
 
 def placement(take: dict) -> dict[str, dict]:
@@ -359,7 +392,7 @@ def capture_manifest(
     action_window: dict,
 ) -> dict:
     slots = placement(take)
-    return {
+    manifest = {
         "schema_version": OFFLINE_CAPTURE_SCHEMA_VERSION,
         "attempt_id": datetime.now().strftime("%Y%m%d-%H%M%S-%f"),
         "status": "awaiting_device_stop",
@@ -388,6 +421,16 @@ def capture_manifest(
             "forward_walk": walk_window,
             "action": action_window,
         },
+        "calibration_window_reference": {
+            "clock": "PC Unix time in seconds",
+            "applies_to_devices": list(DEVICES),
+            "phases": ["npose", "forward_walk"],
+            "selection_rule": (
+                "After USB import, select each device's device_motion whose "
+                "timestampUnixNs plus that device's recorded time offset falls "
+                "inside windows.npose or windows.forward_walk."
+            ),
+        },
         "raw_files": {"iphone": None, "apple_watch": None},
         "failed_attempts": [],
         "artifacts": {
@@ -403,6 +446,11 @@ def capture_manifest(
             "sequenceNumber, and timestampUnixNs during --finalize."
         ),
     }
+    if take.get("subject") is not None:
+        manifest["subject"] = take["subject"]
+    if take.get("experiment") is not None:
+        manifest["experiment"] = copy.deepcopy(take["experiment"])
+    return manifest
 
 
 def record_offline_take(
@@ -536,6 +584,11 @@ def record_offline_take(
     )
 
     cue = ACTION_CUE[take["action"]]
+    post_calibration_instruction = take.get("experiment", {}).get(
+        "post_calibration_instruction", ""
+    )
+    if post_calibration_instruction:
+        print(post_calibration_instruction, flush=True)
     input(f"回到动作起点，准备做{ACTION_LABEL[take['action']]}（{cue}）；按回车继续。")
     beep(880, 200)
     action_window = timed_window(
@@ -614,6 +667,15 @@ def calibrate_once(
     take: dict,
     include_windows: bool = False,
 ) -> dict[str, dict] | tuple[dict[str, dict], dict[str, dict], dict[str, list[dict]]] | None:
+    experiment = take.get("experiment", {})
+    calibration_instruction = experiment.get("calibration_instruction", "")
+    if calibration_instruction:
+        print(calibration_instruction, flush=True)
+    print(
+        "标定要求：戴手表的一侧手臂全程保持固定；前走时不要摆臂或旋转手腕，"
+        "尽量让手表相对身体保持同一姿态。",
+        flush=True,
+    )
     input("站成 N-pose，面向前方，按回车。保持不动，听到提示音后再向前走。")
     print(f"保持不动 {npose_s:.0f} 秒。", flush=True)
     npose_started_unix = time.time()
@@ -648,7 +710,10 @@ def calibrate_once(
         return None
     print("iPhone N-pose 检查通过。", flush=True)
     beep()
-    print("向前走；只使用 iPhone 计算 R_MI。", flush=True)
+    if calibration_instruction:
+        print("请保持上述标定方向向前走；只使用 iPhone 计算 R_MI。", flush=True)
+    else:
+        print("向前走；只使用 iPhone 计算 R_MI。", flush=True)
     walk_started_unix = time.time()
     walk_started_mono = time.monotonic()
     deadline = walk_started_mono + walk_s + 5.0
@@ -767,6 +832,34 @@ def model_space_sequences(
     return orientation.contiguous(), acceleration.contiguous()
 
 
+def add_uwb_to_payload(
+    payload: dict,
+    grid: dict[str, torch.Tensor],
+    uwb_samples: list[dict],
+) -> None:
+    """Attach frame-aligned and native-rate UWB ranging data to labels.pt."""
+    payload.update(
+        {
+            "grid_time_s": grid["grid_time_s"],
+            "uwb_distance_m": grid["uwb_distance_m"],
+            "uwb_timestamp_s": grid["uwb_timestamp_s"],
+            "uwb_valid": grid["uwb_valid"],
+        }
+    )
+    if uwb_samples:
+        payload["uwb_native_timestamp_s"] = torch.tensor(
+            [sample["timestamp_s"] for sample in uwb_samples], dtype=torch.float64
+        )
+        payload["uwb_native_distance_m"] = torch.tensor(
+            [sample["distance_m"] for sample in uwb_samples], dtype=torch.float32
+        )
+        payload["uwb_native_source"] = [sample["source"] for sample in uwb_samples]
+    else:
+        payload["uwb_native_timestamp_s"] = torch.zeros(0, dtype=torch.float64)
+        payload["uwb_native_distance_m"] = torch.zeros(0, dtype=torch.float32)
+        payload["uwb_native_source"] = []
+
+
 def save_sequence(
     directory: Path,
     take: dict,
@@ -781,7 +874,7 @@ def save_sequence(
     slots = placement(take)
     orientation, acceleration = model_space_sequences(calibration, grid)
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "devices": list(DEVICES),
         "slots": [slots[source]["slot"] for source in DEVICES],
         "model_slots": [slots[source]["model_slot"] for source in DEVICES],
@@ -796,6 +889,11 @@ def save_sequence(
         "acceleration": acceleration,
         "motion_valid": grid["motion_valid"],
     }
+    if take.get("subject") is not None:
+        payload["subject"] = take["subject"]
+    if take.get("experiment") is not None:
+        payload["experiment"] = copy.deepcopy(take["experiment"])
+    add_uwb_to_payload(payload, grid, uwb_samples)
     torch.save(payload, directory / "labels.pt")
     save_uwb_plot(directory / "uwb_distance.png", uwb_samples, record_window[0])
     meta = {
@@ -821,7 +919,7 @@ def save_sequence(
             "acceleration": "aM = shared iPhone R_MI @ RIS @ aS; model frame, m/s^2",
             "inertial_up": APPLE_I_UP_RH.tolist(),
             "R_MI": "rows are model X,Y,Z in I; v_M = R_MI @ v_I; up axis is APPLE_I_UP_RH",
-            "uwb": "diagnostic only; UWB is not stored in labels.pt",
+            "uwb": "uwb_ranging.values.distance_m in meters; native samples plus 30 Hz hold of the latest sample",
             "phone_facing": "screen_in = screen faces the thigh, head down; screen_out = screen faces out of the pocket, head down",
         },
         "label_fields": {
@@ -829,6 +927,13 @@ def save_sequence(
             "orientation": "[frame, device, 3, 3] model-frame device orientation",
             "acceleration": "[frame, device, 3] model-frame linear acceleration in m/s^2",
             "motion_valid": "[frame, device] freshness mask for the saved sequences",
+            "grid_time_s": "[frame] seconds from the start of the formal action window",
+            "uwb_distance_m": "[frame, device] latest UWB distance in meters, devices order",
+            "uwb_timestamp_s": "[frame, device] corrected Unix timestamp of the held UWB sample",
+            "uwb_valid": "[frame, device] true when the held UWB sample is no more than 0.5 s old",
+            "uwb_native_timestamp_s": "[sample] corrected Unix timestamps for native-rate action-window UWB",
+            "uwb_native_distance_m": "[sample] native-rate action-window UWB distance in meters",
+            "uwb_native_source": "source device name for each native-rate UWB sample",
         },
         "calibration": {
             source: {
@@ -844,10 +949,25 @@ def save_sequence(
                 "npose_quality": calibration[source].get("npose_quality"),
                 "sample_selection_method": calibration[source].get("sample_selection_method"),
                 "r_mi_comparison": calibration[source].get("r_mi_comparison"),
+                "independent_R_MI_status": calibration[source].get(
+                    "independent_R_MI_status", "not_computed"
+                ),
+                "independent_R_MI": (
+                    calibration[source]["independent_R_MI"].tolist()
+                    if calibration[source].get("independent_R_MI") is not None
+                    else None
+                ),
+                "independent_R_MI_details": calibration[source].get(
+                    "independent_R_MI_details"
+                ),
             }
             for source in DEVICES
         },
     }
+    if take.get("subject") is not None:
+        meta["subject"] = take["subject"]
+    if take.get("experiment") is not None:
+        meta["experiment"] = copy.deepcopy(take["experiment"])
     if offline_info:
         meta["offline_import"] = offline_info
     (directory / "meta.json").write_text(
@@ -1000,6 +1120,34 @@ def samples_between(samples: list[dict], start_s: float, end_s: float) -> list[d
     return [sample for sample in samples if start_s <= sample["timestamp_s"] <= end_s]
 
 
+def calibration_window_summary(
+    samples: list[dict], start_s: float, end_s: float, offset_s: float
+) -> dict:
+    """Describe the exact raw samples selected for one device/phase.
+
+    ``timestamp_s`` has already been shifted onto the PC Unix clock.  Keeping
+    both it and the original device timestamp makes the offline Watch
+    calibration reproducible after a USB import.
+    """
+    summary = {
+        "pc_unix_window_s": {"start": start_s, "end": end_s},
+        "device_time_offset_s": offset_s,
+        "sample_count": len(samples),
+    }
+    if samples:
+        summary["first_sample"] = {
+            "timestampUnixNs": samples[0]["timestamp_unix_ns"],
+            "corrected_pc_unix_s": samples[0]["timestamp_s"],
+            "sequenceNumber": samples[0]["sequence"],
+        }
+        summary["last_sample"] = {
+            "timestampUnixNs": samples[-1]["timestamp_unix_ns"],
+            "corrected_pc_unix_s": samples[-1]["timestamp_s"],
+            "sequenceNumber": samples[-1]["sequence"],
+        }
+    return summary
+
+
 def npose_quality(samples: list[dict], mean_ris: torch.Tensor) -> dict:
     if not samples:
         return {"max_orientation_deviation_deg": None, "acceleration_rms_m_s2": None}
@@ -1091,33 +1239,34 @@ def motion_samples_from_trace(trace_records: list[dict]) -> list[dict]:
     return samples
 
 
-def compute_iphone_calibration(
+def compute_device_calibration(
     npose_samples: list[dict],
     walk_samples: list[dict],
     walk_span_s: float,
     coverage: str,
     context: str,
+    source: str = CALIBRATION_SOURCE,
 ) -> dict:
-    """Run the shared offline calibration checks on one selected sample set."""
+    """Run the shared offline calibration checks on one device's samples."""
     ris_npose = average_ris(npose_samples)
     integrated = integrate_walk(walk_samples, walk_span_s)
     errors = []
     if len(npose_samples) < 10 or ris_npose is None or integrated is None:
         errors.append(
-            f"iphone: N-pose {len(npose_samples)} samples, walk {len(walk_samples)} "
+            f"{source}: N-pose {len(npose_samples)} samples, walk {len(walk_samples)} "
             f"samples; corrected raw coverage {coverage}"
         )
     else:
         stability = npose_quality(npose_samples, ris_npose)
         if stability["max_orientation_deviation_deg"] > MAX_NPOSE_ORIENTATION_DEG:
             errors.append(
-                "iphone: N-pose moved too much; maximum orientation deviation "
+                f"{source}: N-pose moved too much; maximum orientation deviation "
                 f"{stability['max_orientation_deviation_deg']:.1f} deg "
                 f"(limit {MAX_NPOSE_ORIENTATION_DEG:.1f})"
             )
         if stability["acceleration_rms_m_s2"] > MAX_NPOSE_ACCEL_RMS_M_S2:
             errors.append(
-                "iphone: N-pose acceleration RMS "
+                f"{source}: N-pose acceleration RMS "
                 f"{stability['acceleration_rms_m_s2']:.2f} m/s^2 "
                 f"(limit {MAX_NPOSE_ACCEL_RMS_M_S2:.2f})"
             )
@@ -1128,12 +1277,12 @@ def compute_iphone_calibration(
         horizontal_m = 0.0 if built is None else built[1]
         if built is None or horizontal_m < MIN_FORWARD_DISTANCE_M:
             errors.append(
-                f"iphone: forward-walk horizontal displacement is only {horizontal_m:.3f} m "
+                f"{source}: forward-walk horizontal displacement is only {horizontal_m:.3f} m "
                 f"(minimum {MIN_FORWARD_DISTANCE_M:.3f})"
             )
     if errors:
         raise CalibrationError(
-            f"offline iPhone calibration failed ({context}):\n  "
+            f"offline {source} calibration failed ({context}):\n  "
             + "\n  ".join(errors)
             + "\nCheck that the two files belong to this take and use --iphone-time-offset/"
             "--watch-time-offset if device timestamps differ from the PC."
@@ -1153,6 +1302,7 @@ def calibrate_from_files(
     capture: dict,
     take: dict,
     live_trace: dict[str, list[dict]] | None = None,
+    time_offsets_s: dict[str, float] | None = None,
 ) -> dict[str, dict]:
     npose_start, npose_end = window_bounds(capture, "npose")
     walk_start, walk_end = window_bounds(capture, "forward_walk")
@@ -1174,7 +1324,7 @@ def calibrate_from_files(
     }
 
     if live_trace is None:
-        selected = compute_iphone_calibration(
+        selected = compute_device_calibration(
             window_npose_samples,
             window_walk_samples,
             walk_end - walk_start,
@@ -1199,14 +1349,14 @@ def calibrate_from_files(
                 "requested_duration_s", walk_end - walk_start
             )
         )
-        selected = compute_iphone_calibration(
+        selected = compute_device_calibration(
             exact_npose,
             exact_walk,
             requested_walk_s,
             coverage,
             "exact live UDP event identities",
         )
-        trace_replay = compute_iphone_calibration(
+        trace_replay = compute_device_calibration(
             motion_samples_from_trace(live_trace["npose"]),
             motion_samples_from_trace(live_trace["forward_walk"]),
             requested_walk_s,
@@ -1233,7 +1383,7 @@ def calibrate_from_files(
                 live_rmi, trace_replay["R_MI"]
             )
         try:
-            full_window = compute_iphone_calibration(
+            full_window = compute_device_calibration(
                 window_npose_samples,
                 window_walk_samples,
                 walk_end - walk_start,
@@ -1252,6 +1402,53 @@ def calibrate_from_files(
                     selected["R_MI"], full_window["R_MI"]
                 ),
             }
+
+    offsets = time_offsets_s or {source: 0.0 for source in DEVICES}
+    watch_source = "apple_watch"
+    watch_npose_samples = samples_between(motion[watch_source], npose_start, npose_end)
+    watch_walk_samples = samples_between(motion[watch_source], walk_start, walk_end)
+    watch_windows = {
+        "selection_method": "pc_unix_window_from_capture_manifest",
+        "npose": calibration_window_summary(
+            watch_npose_samples, npose_start, npose_end, float(offsets[watch_source])
+        ),
+        "forward_walk": calibration_window_summary(
+            watch_walk_samples, walk_start, walk_end, float(offsets[watch_source])
+        ),
+    }
+    watch_coverage = (
+        "none"
+        if not motion[watch_source]
+        else f"{motion[watch_source][0]['timestamp_s']:.3f}..{motion[watch_source][-1]['timestamp_s']:.3f}"
+    )
+    try:
+        independent_watch = compute_device_calibration(
+            watch_npose_samples,
+            watch_walk_samples,
+            walk_end - walk_start,
+            watch_coverage,
+            "captured PC Unix calibration windows",
+            source=watch_source,
+        )
+        watch_independent = {
+            "status": "passed",
+            "R_MI": independent_watch["R_MI"],
+            "horizontal_m": independent_watch["horizontal_m"],
+            "vertical_m": independent_watch["vertical_m"],
+            "npose_sample_count": independent_watch["npose_sample_count"],
+            "walk_sample_count": independent_watch["walk_sample_count"],
+            "npose_quality": independent_watch["npose_quality"],
+            "window_selection": watch_windows,
+        }
+    except CalibrationError as error:
+        # Wrist motion can make a Watch forward-walk calibration unreliable.
+        # It is a diagnostic and must not invalidate the accepted iPhone
+        # calibration or change the existing shared-R_MI output convention.
+        watch_independent = {
+            "status": "failed",
+            "reason": str(error),
+            "window_selection": watch_windows,
+        }
 
     rotation_mi = selected["R_MI"]
     results = {}
@@ -1275,6 +1472,18 @@ def calibrate_from_files(
                     "npose_quality": selected["npose_quality"],
                     "sample_selection_method": comparison["selection_method"],
                     "r_mi_comparison": comparison,
+                }
+            )
+        elif device_source == watch_source:
+            item.update(
+                {
+                    "independent_R_MI_status": watch_independent["status"],
+                    "independent_R_MI": watch_independent.get("R_MI"),
+                    "independent_R_MI_details": {
+                        key: value
+                        for key, value in watch_independent.items()
+                        if key != "R_MI"
+                    },
                 }
             )
         results[device_source] = item
@@ -1356,6 +1565,26 @@ def stream_quality(samples: list[dict], start_s: float, end_s: float, valid: tor
     }
 
 
+def uwb_quality(
+    samples: list[dict],
+    start_s: float,
+    end_s: float,
+    valid: torch.Tensor,
+) -> dict:
+    selected = samples_between(samples, start_s, end_s)
+    timestamps = [sample["timestamp_s"] for sample in selected]
+    gaps = [right - left for left, right in zip(timestamps, timestamps[1:])]
+    duration_s = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else 0.0
+    return {
+        "action_sample_count": len(selected),
+        "estimated_rate_hz": (len(selected) - 1) / duration_s if duration_s > 0 else None,
+        "max_timestamp_gap_s": max(gaps) if gaps else None,
+        "valid_output_frame_count": int(valid.sum()),
+        "invalid_output_frame_count": int((~valid).sum()),
+        "output_frame_count": int(valid.numel()),
+    }
+
+
 def save_merged_raw(path: Path, events: list[dict]) -> None:
     with path.open("w", encoding="utf-8") as output:
         for event in events:
@@ -1381,6 +1610,10 @@ def finalize_offline_capture(args: argparse.Namespace) -> None:
         "group": int(capture["group"]),
         "phone_facing": capture["phone_facing"],
     }
+    if capture.get("subject") is not None:
+        take["subject"] = capture["subject"]
+    if capture.get("experiment") is not None:
+        take["experiment"] = copy.deepcopy(capture["experiment"])
     live_trace = None
     live_trace_name = capture.get("artifacts", {}).get("live_calibration")
     if live_trace_name:
@@ -1412,7 +1645,13 @@ def finalize_offline_capture(args: argparse.Namespace) -> None:
         raise RuntimeError(
             "raw files contain no complete device_motion for: " + ", ".join(missing)
         )
-    calibration = calibrate_from_files(motion, capture, take, live_trace=live_trace)
+    calibration = calibrate_from_files(
+        motion,
+        capture,
+        take,
+        live_trace=live_trace,
+        time_offsets_s=offsets,
+    )
     action_start, action_end = window_bounds(capture, "action")
     fps = float(capture.get("target_fps", args.fps))
     action_uwb = samples_between(uwb, action_start, action_end)
@@ -1427,6 +1666,12 @@ def finalize_offline_capture(args: argparse.Namespace) -> None:
         "calibration_selection_method": calibration[CALIBRATION_SOURCE].get(
             "sample_selection_method"
         ),
+        "watch_independent_R_MI_status": calibration["apple_watch"].get(
+            "independent_R_MI_status", "not_computed"
+        ),
+        "watch_calibration_windows": calibration["apple_watch"].get(
+            "independent_R_MI_details", {}
+        ).get("window_selection"),
     }
     save_sequence(
         directory,
@@ -1458,6 +1703,14 @@ def finalize_offline_capture(args: argparse.Namespace) -> None:
             "min_forward_distance_m": MIN_FORWARD_DISTANCE_M,
         },
         "r_mi_comparison": calibration[CALIBRATION_SOURCE].get("r_mi_comparison"),
+        "watch_independent_calibration": {
+            "status": calibration["apple_watch"].get(
+                "independent_R_MI_status", "not_computed"
+            ),
+            "details": calibration["apple_watch"].get(
+                "independent_R_MI_details"
+            ),
+        },
         "per_source": {
             source: stream_quality(
                 motion[source],
@@ -1467,7 +1720,20 @@ def finalize_offline_capture(args: argparse.Namespace) -> None:
             )
             for device_index, source in enumerate(DEVICES)
         },
+        "uwb_per_source": {
+            source: uwb_quality(
+                [sample for sample in action_uwb if sample["source"] == source],
+                action_start,
+                action_end,
+                grid["uwb_valid"][:, device_index],
+            )
+            for device_index, source in enumerate(DEVICES)
+        },
     }
+    if take.get("subject") is not None:
+        quality["subject"] = take["subject"]
+    if take.get("experiment") is not None:
+        quality["experiment"] = copy.deepcopy(take["experiment"])
     write_json(directory / "quality.json", quality)
     capture["status"] = "finalized"
     capture["finalized_at_utc"] = datetime.now(timezone.utc).isoformat()
@@ -1483,6 +1749,12 @@ def finalize_offline_capture(args: argparse.Namespace) -> None:
             "sample_selection_method"
         ),
         "r_mi_comparison": calibration[CALIBRATION_SOURCE].get("r_mi_comparison"),
+        "watch_independent_R_MI_status": calibration["apple_watch"].get(
+            "independent_R_MI_status", "not_computed"
+        ),
+        "watch_independent_calibration": calibration["apple_watch"].get(
+            "independent_R_MI_details"
+        ),
     }
     capture.setdefault("artifacts", {}).update(
         {"raw": "raw.ndjson", "labels": LABELS_FILENAME, "quality": "quality.json"}
@@ -1507,6 +1779,11 @@ def finalize_offline_capture(args: argparse.Namespace) -> None:
     exact_angle = comparison.get("online_saved_vs_offline_exact_deg")
     if exact_angle is not None:
         print(f"  在线 R_MI 与离线精确复算差异：{exact_angle:.6f} deg")
+    watch_status = calibration["apple_watch"].get("independent_R_MI_status")
+    if watch_status == "passed":
+        print("  Apple Watch 离线独立 R_MI：已由标定时间窗计算（不改变共享 iPhone R_MI 输出）。")
+    elif watch_status == "failed":
+        print("  Apple Watch 离线独立 R_MI：未通过质量检查；详情已写入 meta.json。")
 
 
 def inspect_inbox_file(path: Path) -> dict:
@@ -1634,6 +1911,8 @@ def write_session_map(root: Path) -> Path:
                     "phone_pocket": capture.get("phone_pocket"),
                     "group": capture.get("group"),
                     "phone_facing": capture.get("phone_facing"),
+                    "subject": capture.get("subject"),
+                    "experiment": capture.get("experiment"),
                     "capture": str(capture_path.resolve()),
                 }
             )
@@ -1795,6 +2074,164 @@ def finalize_batch(args: argparse.Namespace, root: Path) -> None:
     print(f"序列与手机会话对应表：{session_map_path}")
 
 
+def load_uwb_from_merged_raw(path: Path, offsets: dict[str, float]) -> list[dict]:
+    """Load corrected UWB events from a finalized sequence's raw.ndjson."""
+    samples = []
+    with path.open("r", encoding="utf-8") as raw_file:
+        for line_number, line in enumerate(raw_file, start=1):
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise RuntimeError(f"{path}:{line_number} JSON 无效：{error}") from error
+            if not isinstance(event, dict) or event.get("sensor") != "uwb_ranging":
+                continue
+            source = canonical_source(event.get("source"), "")
+            if source not in DEVICES:
+                continue
+            values = event.get("values")
+            distance = values.get("distance_m") if isinstance(values, dict) else None
+            if not isinstance(distance, (int, float)):
+                continue
+            samples.append(
+                {
+                    "source": source,
+                    "timestamp_s": event_timestamp_s(event) + float(offsets[source]),
+                    "distance_m": float(distance),
+                }
+            )
+    samples.sort(key=lambda item: (item["timestamp_s"], item["source"]))
+    return samples
+
+
+def upgrade_existing_uwb(args: argparse.Namespace, root: Path) -> None:
+    """Add frame-aligned UWB fields to already-finalized labels.pt files."""
+    if not root.is_dir():
+        raise RuntimeError(f"正式采集目录不存在：{root}")
+    results = []
+    for labels_path in sorted(root.rglob(LABELS_FILENAME)):
+        directory = labels_path.parent
+        relative_path = directory.relative_to(root)
+        if "_trial" in relative_path.parts:
+            continue
+        capture_path = directory / CAPTURE_FILENAME
+        raw_path = directory / "raw.ndjson"
+        meta_path = directory / "meta.json"
+        quality_path = directory / "quality.json"
+        if not capture_path.is_file():
+            results.append(
+                {"sequence": relative_path.as_posix(), "status": "failed", "reason": "missing capture.json"}
+            )
+            continue
+        capture = json.loads(capture_path.read_text(encoding="utf-8"))
+        if args.only_action is not None and capture.get("action") != args.only_action:
+            continue
+        payload = torch.load(labels_path, map_location="cpu", weights_only=False)
+        if "uwb_distance_m" in payload and not args.force_finalize:
+            results.append({"sequence": relative_path.as_posix(), "status": "already_upgraded"})
+            continue
+        if not raw_path.is_file():
+            results.append(
+                {"sequence": relative_path.as_posix(), "status": "failed", "reason": "missing raw.ndjson"}
+            )
+            continue
+        offsets = capture.get("time_offsets_s")
+        if not isinstance(offsets, dict) or any(source not in offsets for source in DEVICES):
+            results.append(
+                {
+                    "sequence": relative_path.as_posix(),
+                    "status": "failed",
+                    "reason": "capture.json missing time_offsets_s",
+                }
+            )
+            continue
+        try:
+            action_start, action_end = window_bounds(capture, "action")
+            fps = float(payload.get("fps", capture.get("target_fps", args.fps)))
+            all_uwb = load_uwb_from_merged_raw(raw_path, offsets)
+            action_uwb = samples_between(all_uwb, action_start, action_end)
+            empty_motion = {source: [] for source in DEVICES}
+            grid = build_offline_grid(empty_motion, action_uwb, action_start, action_end, fps)
+            expected_frames = int(payload["orientation"].shape[0])
+            if int(grid["uwb_distance_m"].shape[0]) != expected_frames:
+                raise RuntimeError(
+                    f"UWB 帧数 {grid['uwb_distance_m'].shape[0]} 与标签帧数 {expected_frames} 不一致"
+                )
+            add_uwb_to_payload(payload, grid, action_uwb)
+            payload["schema_version"] = max(int(payload.get("schema_version", 0)), 3)
+            torch.save(payload, labels_path)
+
+            if meta_path.is_file():
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                meta.setdefault("convention", {})["uwb"] = (
+                    "uwb_ranging.values.distance_m in meters; native samples plus "
+                    "30 Hz hold of the latest sample"
+                )
+                meta.setdefault("label_fields", {}).update(
+                    {
+                        "grid_time_s": "[frame] seconds from the start of the formal action window",
+                        "uwb_distance_m": "[frame, device] latest UWB distance in meters, devices order",
+                        "uwb_timestamp_s": "[frame, device] corrected Unix timestamp of the held UWB sample",
+                        "uwb_valid": "[frame, device] true when the held UWB sample is no more than 0.5 s old",
+                        "uwb_native_timestamp_s": "[sample] corrected Unix timestamps for native-rate action-window UWB",
+                        "uwb_native_distance_m": "[sample] native-rate action-window UWB distance in meters",
+                        "uwb_native_source": "source device name for each native-rate UWB sample",
+                    }
+                )
+                write_json(meta_path, meta)
+
+            if quality_path.is_file():
+                quality = json.loads(quality_path.read_text(encoding="utf-8"))
+                quality["uwb_per_source"] = {
+                    source: uwb_quality(
+                        [sample for sample in action_uwb if sample["source"] == source],
+                        action_start,
+                        action_end,
+                        grid["uwb_valid"][:, device_index],
+                    )
+                    for device_index, source in enumerate(DEVICES)
+                }
+                write_json(quality_path, quality)
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+            results.append(
+                {"sequence": relative_path.as_posix(), "status": "failed", "reason": str(error)}
+            )
+            continue
+        results.append(
+            {
+                "sequence": relative_path.as_posix(),
+                "status": "upgraded",
+                "native_uwb_sample_count": len(action_uwb),
+                "valid_frame_count": {
+                    source: int(grid["uwb_valid"][:, device_index].sum())
+                    for device_index, source in enumerate(DEVICES)
+                },
+            }
+        )
+
+    counts = {
+        status: sum(item["status"] == status for item in results)
+        for status in ("upgraded", "already_upgraded", "failed")
+    }
+    report_path = root / "uwb_upgrade_report.json"
+    write_json(
+        report_path,
+        {
+            "schema_version": 1,
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "only_action": args.only_action,
+            "counts": counts,
+            "results": results,
+        },
+    )
+    print(
+        f"UWB 标签升级完成：成功 {counts['upgraded']}，"
+        f"已包含 UWB {counts['already_upgraded']}，失败 {counts['failed']}"
+    )
+    print(f"升级报告：{report_path}")
+
+
 def receive_and_finalize(
     directory: Path,
     root: Path,
@@ -1930,10 +2367,11 @@ def record_take(
 
 def run_self_test() -> None:
     plan = collection_plan()
-    if len(plan) != 9 * 4 * 3 * 2:
-        raise AssertionError(f"expected 216 takes, got {len(plan)}")
-    if len({item["action"] for item in plan}) != 9:
-        raise AssertionError("expected 9 actions")
+    expected_take_count = len(ACTIONS) * 4 * 3 * 2
+    if len(plan) != expected_take_count:
+        raise AssertionError(f"expected {expected_take_count} takes, got {len(plan)}")
+    if len({item["action"] for item in plan}) != len(ACTIONS):
+        raise AssertionError(f"expected {len(ACTIONS)} actions")
     wears = {(item["watch"], item["phone_pocket"]) for item in plan}
     if wears != {("lw", "lp"), ("lw", "rp"), ("rw", "lp"), ("rw", "rp")}:
         raise AssertionError(f"wear set mismatch: {wears}")
@@ -1942,7 +2380,7 @@ def run_self_test() -> None:
     if groups != {1, 2, 3} or facings != {"screen_out", "screen_in"}:
         raise AssertionError(f"group/facing mismatch: {groups} {facings}")
     directories = {sequence_directory(Path("train_labels"), item).as_posix() for item in plan}
-    if len(directories) != 216:
+    if len(directories) != expected_take_count:
         raise AssertionError(f"directory collision: {len(directories)}")
     right = placement({"watch": "rw", "phone_pocket": "rp"})
     left = placement({"watch": "lw", "phone_pocket": "lp"})
@@ -2049,7 +2487,7 @@ def run_self_test() -> None:
             if 3.0 <= sample["timestamp_s"] <= 6.0 and sample["sequence"] != 70
         ],
     }
-    trace_reference = compute_iphone_calibration(
+    trace_reference = compute_device_calibration(
         motion_samples_from_trace(trace["npose"]),
         motion_samples_from_trace(trace["forward_walk"]),
         3.0,
@@ -2094,9 +2532,20 @@ def run_self_test() -> None:
     }
     if capture_session_ids(session_test_capture) != ["self-test-session"]:
         raise AssertionError("capture sessionID extraction failed")
-    grid = build_offline_grid(synthetic_motion, [], 7.0, 8.0, 30.0)
+    synthetic_uwb = [
+        {"source": source, "timestamp_s": timestamp_s, "distance_m": distance_m}
+        for source, distance_m in (("apple_watch", 0.72), ("iphone", 0.74))
+        for timestamp_s in (7.0, 7.4, 7.8)
+    ]
+    grid = build_offline_grid(synthetic_motion, synthetic_uwb, 7.0, 8.0, 30.0)
     if grid["aS"].shape != (30, 2, 3) or not bool(grid["motion_valid"].all()):
         raise AssertionError("offline grid self-test failed")
+    if grid["uwb_distance_m"].shape != (30, 2) or not bool(grid["uwb_valid"].all()):
+        raise AssertionError("frame-aligned UWB grid self-test failed")
+    uwb_payload = {}
+    add_uwb_to_payload(uwb_payload, grid, synthetic_uwb)
+    if uwb_payload["uwb_native_distance_m"].shape != (6,):
+        raise AssertionError("native UWB payload self-test failed")
     orientation, acceleration = model_space_sequences(calibration, grid)
     if orientation.shape != (30, 2, 3, 3) or acceleration.shape != (30, 2, 3):
         raise AssertionError("model-space sequence shapes are incorrect")
@@ -2146,7 +2595,7 @@ def run_self_test() -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "采集 216 条设备本地训练序列，并从 iPhone/Watch NDJSON 离线生成 labels.pt"
+            "采集设备本地训练序列，并从 iPhone/Watch NDJSON 离线生成 labels.pt"
         )
     )
     parser.add_argument(
@@ -2166,9 +2615,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--walk", type=float, default=3.0)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument(
+        "--subject",
+        type=subject_id,
+        default=None,
+        metavar="ID",
+        help="受试者编号；新受试者默认保存到 data/datasets/subjects/ID/，不填则沿用原目录",
+    )
+    parser.add_argument(
         "--inbox",
         type=Path,
-        default=DEFAULT_INBOX_DIR,
+        default=None,
         help="每条采集后接收 iPhone/Watch 文件的电脑目录",
     )
     parser.add_argument(
@@ -2187,8 +2643,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="旧版双设备实时 UDP 模式；默认不再使用",
     )
-    parser.add_argument("--once", action="store_true", help="只试录一条，写到 _trial/，不占用 216 条正式计划")
+    parser.add_argument("--once", action="store_true", help="只试录一条，写到 _trial/，不占用正式计划")
     parser.add_argument("--action", choices=ACTIONS, default="Walking")
+    parser.add_argument(
+        "--only-action",
+        choices=ACTIONS,
+        default=None,
+        metavar="ACTION",
+        help=(
+            "正式采集时只遍历一个动作的全部佩戴/组别/朝向"
+            f"（共 {len(WATCHES) * len(POCKETS) * len(GROUPS) * len(FACINGS)} 条）"
+        ),
+    )
     parser.add_argument("--watch", choices=WATCHES, default="lw")
     parser.add_argument("--phone-pocket", choices=POCKETS, default="lp")
     parser.add_argument("--group", type=int, choices=GROUPS, default=1)
@@ -2206,10 +2672,15 @@ def parse_args() -> argparse.Namespace:
         help="扫描 USB 导出的全部原始文件，按 sessionID 配对并整理所有正式序列",
     )
     parser.add_argument(
+        "--upgrade-existing-uwb",
+        action="store_true",
+        help="从每条已整理序列的 raw.ndjson 补写逐帧和原生 UWB 到 labels.pt",
+    )
+    parser.add_argument(
         "--raw-root",
         type=Path,
-        default=DEFAULT_RAW_ROOT,
-        help=f"--finalize-batch 扫描的原始文件根目录（默认：{DEFAULT_RAW_ROOT}）",
+        default=None,
+        help="--finalize-batch 扫描的原始文件根目录；指定 --subject 时默认使用该受试者的 train_raw",
     )
     parser.add_argument("--iphone-file", type=Path, default=None)
     parser.add_argument("--watch-file", type=Path, default=None)
@@ -2249,9 +2720,11 @@ def run_legacy_once(args: argparse.Namespace, root: Path) -> None:
         "group": args.group,
         "phone_facing": args.phone_facing,
     }
+    if args.subject is not None:
+        take["subject"] = args.subject
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     directory = root / "_trial" / f"{stamp}_{take['action']}_{take['watch']}_{take['phone_pocket']}_g{take['group']:02d}_{take['phone_facing']}"
-    print("试录一条。结果写到 _trial/，不占用 216 条正式计划。")
+    print("试录一条。结果写到 _trial/，不占用正式计划。")
     print(take_prompt(take, 1, 1))
     print("标定里的向前走不是动作本身；提示音之后的 20 秒才录这个动作。")
     with SensorReadReceiver(args.host, args.port) as receiver:
@@ -2290,6 +2763,8 @@ def run_offline_once(args: argparse.Namespace, root: Path) -> None:
         "group": args.group,
         "phone_facing": args.phone_facing,
     }
+    if args.subject is not None:
+        take["subject"] = args.subject
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     directory = (
         root
@@ -2299,7 +2774,7 @@ def run_offline_once(args: argparse.Namespace, root: Path) -> None:
             f"g{take['group']:02d}_{take['phone_facing']}"
         )
     )
-    print("离线试采一条。结果先写 capture.json，不占用 216 条正式计划。")
+    print("离线试采一条。结果先写 capture.json，不占用正式计划。")
     record_offline_take(root, take, 1, 1, args, directory=directory)
 
 
@@ -2308,7 +2783,16 @@ def main() -> None:
     if args.self_test:
         run_self_test()
         return
-    root = args.output or (Path(__file__).resolve().parent / "data" / "datasets" / "train_labels")
+    root = subject_paths(args)
+    if args.subject is not None and args.finalize is None:
+        print(f"受试者编号：{args.subject}")
+        print(f"该受试者采集及标签目录：{root.resolve()}")
+        print(f"该受试者手机原始文件目录：{args.raw_root.resolve()}")
+    if args.upgrade_existing_uwb:
+        if args.finalize is not None or args.finalize_batch:
+            raise SystemExit("--upgrade-existing-uwb 不能和 --finalize/--finalize-batch 同时使用")
+        upgrade_existing_uwb(args, root)
+        return
     if args.finalize is not None:
         if args.finalize_batch:
             raise SystemExit("--finalize 和 --finalize-batch 不能同时使用")
@@ -2323,6 +2807,8 @@ def main() -> None:
         raise SystemExit("端口必须在 1 到 65535 之间")
     if args.import_each and args.defer_import:
         raise SystemExit("--import-each 和 --defer-import 不能同时使用")
+    if args.once and args.only_action is not None:
+        raise SystemExit("--once 和 --only-action 不能同时使用；--once 使用 --action 指定单条试采")
     if not args.once and not args.legacy_live and not args.import_each:
         args.defer_import = True
     if args.once:
@@ -2332,11 +2818,18 @@ def main() -> None:
             run_offline_once(args, root)
         return
     plan = collection_plan()
+    if args.only_action is not None:
+        plan = [take for take in plan if take["action"] == args.only_action]
+    if args.subject is not None:
+        plan = [{**take, "subject": args.subject} for take in plan]
     root.mkdir(parents=True, exist_ok=True)
     (root / "plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"计划 {len(plan)} 条：9 个动作 × 4 种佩戴（lw/rw × lp/rp）× 3 组 × 2 种口袋朝向。")
-    print("顺序：先固定一种佩戴，做完九个动作，再换手表或口袋。")
-    print("每一组先屏幕朝内、头朝下，再屏幕朝外、头朝下。")
+    if args.only_action is None:
+        print(f"计划 {len(plan)} 条：{len(ACTIONS)} 个动作 × 4 种佩戴（lw/rw × lp/rp）× 3 组 × 2 种口袋朝向。")
+    else:
+        print(f"本次仅采集动作 {args.only_action}：4 种佩戴 × 3 组 × 2 种口袋朝向，共 {len(plan)} 条。")
+    print("顺序：固定一种佩戴和手机朝向，依次录完所有动作及其组别，再切换手机朝向；两种朝向完成后再换佩戴。")
+    print("每种佩戴先录屏幕朝内、头朝下的全部动作，再录屏幕朝外、头朝下的全部动作。")
     print("标定走步不是动作本身；提示音后的 20 秒才是该动作。")
     if args.legacy_live:
         print("旧版模式：已有 labels.pt 的条目会自动跳过。")
@@ -2351,10 +2844,15 @@ def main() -> None:
                 if wear != previous_wear:
                     watch = WATCH_INFO[take["watch"]]
                     pocket = POCKET_INFO[take["phone_pocket"]]
+                    stage_count = sum(
+                        1
+                        for planned_take in plan
+                        if (planned_take["watch"], planned_take["phone_pocket"]) == wear
+                    )
                     print(
                         f"\n下一阶段：手表戴在{watch['label']}（{take['watch']}），"
                         f"手机放在{pocket['label']}（{take['phone_pocket']}）。\n"
-                        f"本阶段 54 条：9 个动作，每个动作 3 组，每组 2 种朝向。",
+                        f"本阶段 {stage_count} 条。",
                         flush=True,
                     )
                     previous_wear = wear
@@ -2378,10 +2876,15 @@ def main() -> None:
             if wear != previous_wear:
                 watch = WATCH_INFO[take["watch"]]
                 pocket = POCKET_INFO[take["phone_pocket"]]
+                stage_count = sum(
+                    1
+                    for planned_take in plan
+                    if (planned_take["watch"], planned_take["phone_pocket"]) == wear
+                )
                 print(
                     f"\n下一阶段：手表戴在{watch['label']}（{take['watch']}），"
                     f"手机放在{pocket['label']}（{take['phone_pocket']}）。\n"
-                    f"本阶段 54 条：9 个动作，每个动作 3 组，每组 2 种朝向。",
+                    f"本阶段 {stage_count} 条。",
                     flush=True,
                 )
                 previous_wear = wear
@@ -2393,10 +2896,16 @@ def main() -> None:
                 print(f"序列与手机会话对应表：{session_map_path}")
                 return
         session_map_path = write_session_map(root)
-        print(f"\n216 条计划已走完。采集清单在 {root}")
+        print(f"\n{len(plan)} 条计划已走完。采集清单在 {root}")
         print(f"序列与手机会话对应表：{session_map_path}")
         print("USB 一次复制完手机中的全部会话后，运行：")
-        print(f'  python collect_train_sequence.py --finalize-batch --raw-root "{args.raw_root}"')
+        finalize_command = "python collect_train_sequence.py --finalize-batch"
+        if args.subject is not None:
+            finalize_command += f" --subject {args.subject}"
+        if args.output is not None:
+            finalize_command += f' --output "{args.output}"'
+        finalize_command += f' --raw-root "{args.raw_root}"'
+        print(f"  {finalize_command}")
 
 
 if __name__ == "__main__":
