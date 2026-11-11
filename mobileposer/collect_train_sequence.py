@@ -110,7 +110,12 @@ DEFAULT_RAW_ROOT = Path(__file__).resolve().parent / "data" / "datasets" / "trai
 DEFAULT_LABEL_ROOT = Path(__file__).resolve().parent / "data" / "datasets" / "train_labels"
 MAX_NPOSE_ORIENTATION_DEG = 12.0
 MAX_NPOSE_ACCEL_RMS_M_S2 = 1.5
-MIN_FORWARD_DISTANCE_M = 0.02
+# A three-second deliberate forward walk must provide a usable horizontal
+# direction.  The earlier 2 cm guard only rejected a numerically zero vector.
+MIN_FORWARD_DISTANCE_M = 0.15
+MAX_FORWARD_DIRECTION_CHANGE_DEG = 45.0
+MAX_FORWARD_WINDOW_SENSITIVITY_DEG = 60.0
+FORWARD_STABILITY_TRIM_S = 0.10
 CALIBRATION_SOURCE = "iphone"
 SOURCE_ALIASES = {
     "apple_watch": "apple_watch",
@@ -617,6 +622,7 @@ def record_offline_take(
         "npose_sample_count": phone_calibration["npose_sample_count"],
         "walk_sample_count": phone_calibration["walk_sample_count"],
         "npose_quality": phone_calibration["npose_quality"],
+        "forward_walk_quality": phone_calibration["forward_walk_quality"],
         "watch_uses_iphone_r_mi": True,
         "sample_selection_method": "explicit_event_identity",
         "sample_artifact": LIVE_CALIBRATION_FILENAME,
@@ -760,8 +766,10 @@ def calibrate_once(
         f"horizontal={horizontal_m:.4f} m",
         flush=True,
     )
-    if built is None or horizontal_m < MIN_FORWARD_DISTANCE_M:
-        print(f"iPhone 标定失败：没有积出水平前进方向（水平 {horizontal_m:.3f} m）")
+    forward_quality = forward_walk_quality(walk_samples, walk_s)
+    if not forward_quality["ok"]:
+        reasons = "；".join(forward_quality["errors"])
+        print(f"iPhone 标定失败：前向走质量不通过（{reasons}）", flush=True)
         return None
 
     rotation_mi = built[0]
@@ -784,11 +792,14 @@ def calibrate_once(
                     "npose_sample_count": len(npose_samples),
                     "walk_sample_count": len(walk_samples),
                     "npose_quality": stability,
+                    "forward_walk_quality": forward_quality,
                 }
             )
         results[source] = item
     print(
         f"iPhone 标定通过：水平 {horizontal_m:.2f} m，沿向上轴 {vertical_m:.2f} m；"
+        f"前后段方向差 {forward_quality['direction_stability']['angle_deg']:.1f}°，"
+        f"窗口敏感性 {forward_quality['window_sensitivity']['max_angle_deg']:.1f}°；"
         "Apple Watch 复用 iPhone R_MI。",
         flush=True,
     )
@@ -947,6 +958,7 @@ def save_sequence(
                 "npose_sample_count": calibration[source].get("npose_sample_count"),
                 "walk_sample_count": calibration[source].get("walk_sample_count"),
                 "npose_quality": calibration[source].get("npose_quality"),
+                "forward_walk_quality": calibration[source].get("forward_walk_quality"),
                 "sample_selection_method": calibration[source].get("sample_selection_method"),
                 "r_mi_comparison": calibration[source].get("r_mi_comparison"),
                 "independent_R_MI_status": calibration[source].get(
@@ -1172,6 +1184,119 @@ def rotation_difference_deg(left: torch.Tensor, right: torch.Tensor) -> float:
     relative = left @ right.transpose(0, 1)
     cosine = ((torch.trace(relative) - 1.0) / 2.0).clamp(-1.0, 1.0)
     return float(torch.rad2deg(torch.acos(cosine)))
+
+
+def forward_walk_quality(samples: list[dict], walk_s: float) -> dict:
+    """Measure whether iPhone forward-walk calibration is well conditioned.
+
+    The full window supplies the accepted R_MI.  Two overlapping 75%-length
+    portions test whether its direction changes during the walk.  Four small
+    inward trims test sensitivity to plausible receipt-window boundaries.
+    """
+    ordered = sorted(samples, key=lambda item: item["timestamp_s"])
+    if len(ordered) < 2:
+        return {"ok": False, "reason": "forward-walk samples are insufficient"}
+    first_t = ordered[0]["timestamp_s"]
+    last_t = ordered[-1]["timestamp_s"]
+
+    def estimate(start_t: float, end_t: float) -> dict | None:
+        selected = [item for item in ordered if start_t <= item["timestamp_s"] <= end_t]
+        span_s = end_t - start_t
+        integrated = integrate_walk(selected, span_s)
+        if integrated is None:
+            return None
+        position, velocity, duration_s = integrated
+        corrected = position - 0.5 * duration_s * velocity
+        built = rmi_from_displacement(corrected)
+        if built is None:
+            return None
+        return {
+            "R_MI": built[0],
+            "horizontal_m": float(built[1]),
+            "sample_count": len(selected),
+            "span_s": span_s,
+        }
+
+    full = estimate(first_t, first_t + walk_s)
+    if full is None:
+        return {"ok": False, "reason": "forward direction could not be integrated"}
+
+    # Use a 75% early/late overlap to avoid deciding a walking direction from
+    # a very short half-window.
+    available_s = min(walk_s, last_t - first_t)
+    portion_s = 0.75 * available_s
+    early = estimate(first_t, first_t + portion_s)
+    late = estimate(first_t + available_s - portion_s, first_t + available_s)
+    direction_change_deg = (
+        rotation_difference_deg(early["R_MI"], late["R_MI"])
+        if early is not None and late is not None
+        else None
+    )
+
+    variants = {"full": full}
+    for start_trim, end_trim, name in (
+        (FORWARD_STABILITY_TRIM_S, 0.0, "trim_start"),
+        (0.0, FORWARD_STABILITY_TRIM_S, "trim_end"),
+        (FORWARD_STABILITY_TRIM_S, FORWARD_STABILITY_TRIM_S, "trim_both"),
+    ):
+        variant = estimate(first_t + start_trim, first_t + available_s - end_trim)
+        if variant is not None:
+            variants[name] = variant
+    sensitivity_angles = [
+        rotation_difference_deg(full["R_MI"], item["R_MI"])
+        for name, item in variants.items()
+        if name != "full"
+    ]
+    window_sensitivity_deg = max(sensitivity_angles) if sensitivity_angles else None
+
+    errors = []
+    if full["horizontal_m"] < MIN_FORWARD_DISTANCE_M:
+        errors.append(
+            f"horizontal displacement {full['horizontal_m']:.3f} m "
+            f"is below {MIN_FORWARD_DISTANCE_M:.3f} m"
+        )
+    if direction_change_deg is None:
+        errors.append("could not estimate both overlapping forward-walk directions")
+    elif direction_change_deg > MAX_FORWARD_DIRECTION_CHANGE_DEG:
+        errors.append(
+            f"early/late direction change {direction_change_deg:.1f} deg "
+            f"exceeds {MAX_FORWARD_DIRECTION_CHANGE_DEG:.1f} deg"
+        )
+    if window_sensitivity_deg is None:
+        errors.append("could not estimate inward-trim window sensitivity")
+    elif window_sensitivity_deg > MAX_FORWARD_WINDOW_SENSITIVITY_DEG:
+        errors.append(
+            f"0.1 s window-trim sensitivity {window_sensitivity_deg:.1f} deg "
+            f"exceeds {MAX_FORWARD_WINDOW_SENSITIVITY_DEG:.1f} deg"
+        )
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "full_window": {
+            "horizontal_m": full["horizontal_m"],
+            "sample_count": full["sample_count"],
+            "span_s": full["span_s"],
+        },
+        "direction_stability": {
+            "method": "overlapping early/late 75% forward-walk windows",
+            "angle_deg": direction_change_deg,
+            "limit_deg": MAX_FORWARD_DIRECTION_CHANGE_DEG,
+        },
+        "window_sensitivity": {
+            "method": "full window versus 0.1 s inward start/end trims",
+            "max_angle_deg": window_sensitivity_deg,
+            "limit_deg": MAX_FORWARD_WINDOW_SENSITIVITY_DEG,
+            "variants": {
+                name: {
+                    "horizontal_m": item["horizontal_m"],
+                    "sample_count": item["sample_count"],
+                    "span_s": item["span_s"],
+                }
+                for name, item in variants.items()
+            },
+        },
+        "minimum_horizontal_distance_m": MIN_FORWARD_DISTANCE_M,
+    }
 
 
 def trace_record_identity(record: dict) -> tuple[str, int, int]:
@@ -1470,6 +1595,9 @@ def calibrate_from_files(
                     "npose_sample_count": selected["npose_sample_count"],
                     "walk_sample_count": selected["walk_sample_count"],
                     "npose_quality": selected["npose_quality"],
+                    "forward_walk_quality": capture.get("live_iphone_calibration", {}).get(
+                        "forward_walk_quality"
+                    ),
                     "sample_selection_method": comparison["selection_method"],
                     "r_mi_comparison": comparison,
                 }
@@ -1701,7 +1829,13 @@ def finalize_offline_capture(args: argparse.Namespace) -> None:
             "max_npose_orientation_deviation_deg": MAX_NPOSE_ORIENTATION_DEG,
             "max_npose_acceleration_rms_m_s2": MAX_NPOSE_ACCEL_RMS_M_S2,
             "min_forward_distance_m": MIN_FORWARD_DISTANCE_M,
+            "max_forward_direction_change_deg": MAX_FORWARD_DIRECTION_CHANGE_DEG,
+            "max_forward_window_sensitivity_deg": MAX_FORWARD_WINDOW_SENSITIVITY_DEG,
+            "forward_window_trim_s": FORWARD_STABILITY_TRIM_S,
         },
+        "live_forward_walk_quality": capture.get("live_iphone_calibration", {}).get(
+            "forward_walk_quality"
+        ),
         "r_mi_comparison": calibration[CALIBRATION_SOURCE].get("r_mi_comparison"),
         "watch_independent_calibration": {
             "status": calibration["apple_watch"].get(
@@ -2456,6 +2590,14 @@ def run_self_test() -> None:
         calibration["apple_watch"]["R_MI"], calibration["iphone"]["R_MI"]
     ):
         raise AssertionError("Apple Watch should reuse the iPhone R_MI")
+    synthetic_forward_quality = forward_walk_quality(
+        [sample for sample in synthetic_motion[CALIBRATION_SOURCE] if 3.0 <= sample["timestamp_s"] <= 6.0],
+        3.0,
+    )
+    if not synthetic_forward_quality["ok"]:
+        raise AssertionError(
+            f"stable synthetic forward walk should pass quality checks: {synthetic_forward_quality}"
+        )
     trace_source = synthetic_motion[CALIBRATION_SOURCE]
     trace = {
         "npose": [
