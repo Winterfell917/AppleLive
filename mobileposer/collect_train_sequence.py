@@ -27,6 +27,7 @@ import argparse
 import bisect
 import copy
 import json
+import math
 import statistics
 import time
 from datetime import datetime, timezone
@@ -116,6 +117,15 @@ MIN_FORWARD_DISTANCE_M = 0.15
 MAX_FORWARD_DIRECTION_CHANGE_DEG = 45.0
 MAX_FORWARD_WINDOW_SENSITIVITY_DEG = 60.0
 FORWARD_STABILITY_TRIM_S = 0.10
+FORWARD_ANCHOR_START_S = 0.6
+FORWARD_ANCHOR_END_S = 0.8
+FORWARD_ANCHOR_TIMEOUT_S = 6.0
+MIN_ANCHORED_FORWARD_DISTANCE_M = 0.30
+MAX_ANCHORED_WINDOW_SENSITIVITY_DEG = 30.0
+MAX_ANCHOR_ORIENTATION_CHANGE_DEG = 25.0
+MAX_ANCHOR_ACCEL_RMS_M_S2 = 1.5
+MAX_ANCHOR_GYRO_RMS_RAD_S = 0.8
+MAX_FORWARD_SAMPLE_GAP_S = 0.15
 CALIBRATION_SOURCE = "iphone"
 SOURCE_ALIASES = {
     "apple_watch": "apple_watch",
@@ -714,23 +724,25 @@ def calibrate_once(
             f"超过 {MAX_NPOSE_ACCEL_RMS_M_S2:.2f} m/s^2"
         )
         return None
-    print("iPhone N-pose 检查通过。", flush=True)
-    beep()
+    print("iPhone N-pose 检查通过。保持原朝向；听到开始音后直线向前走，结束音后停稳并保持不动。", flush=True)
     if calibration_instruction:
         print("请保持上述标定方向向前走；只使用 iPhone 计算 R_MI。", flush=True)
     else:
         print("向前走；只使用 iPhone 计算 R_MI。", flush=True)
     walk_started_unix = time.time()
     walk_started_mono = time.monotonic()
-    deadline = walk_started_mono + walk_s + 5.0
+    time.sleep(FORWARD_ANCHOR_START_S)
+    beep(880, 180)
+    moving_started_mono = time.monotonic()
+    deadline = moving_started_mono + walk_s + 5.0
     while time.monotonic() < deadline:
-        samples = receiver.motion_since(CALIBRATION_SOURCE, walk_started_mono)
+        samples = receiver.motion_since(CALIBRATION_SOURCE, moving_started_mono)
         if len(samples) >= 2 and samples[-1]["timestamp_s"] - samples[0]["timestamp_s"] >= walk_s:
             break
         time.sleep(0.01)
     else:
         print("走路窗口内没有收齐 iPhone 数据。")
-        samples = receiver.motion_since(CALIBRATION_SOURCE, walk_started_mono)
+        samples = receiver.motion_since(CALIBRATION_SOURCE, moving_started_mono)
         if len(samples) < 2:
             print(f"  {CALIBRATION_SOURCE}: {len(samples)} 条")
         else:
@@ -739,6 +751,26 @@ def calibrate_once(
                 f"  {CALIBRATION_SOURCE}: {len(samples)} 条，"
                 f"时间戳跨度 {span:.2f} s（需要 {walk_s:.0f} s）"
         )
+        return None
+
+    beep(660, 250)
+    print("前走结束：请在终点停稳，保持原朝向，手机不要移动。", flush=True)
+    stopping_started_mono = time.monotonic()
+    rest_deadline = stopping_started_mono + FORWARD_ANCHOR_TIMEOUT_S
+    while time.monotonic() < rest_deadline:
+        stopping_samples = receiver.motion_since(CALIBRATION_SOURCE, stopping_started_mono)
+        if len(stopping_samples) >= 10:
+            latest_received = stopping_samples[-1]["received_mono"]
+            rest = [sample for sample in stopping_samples
+                    if sample["received_mono"] >= latest_received - FORWARD_ANCHOR_END_S]
+            if (time.monotonic() - stopping_started_mono >= FORWARD_ANCHOR_END_S
+                    and rest[-1]["received_mono"] - rest[0]["received_mono"]
+                    >= FORWARD_ANCHOR_END_S * 0.94
+                    and stationary_anchor_quality(rest)["ok"]):
+                break
+        time.sleep(0.05)
+    else:
+        print("iPhone 标定失败：前走结束后未检测到连续静止，请重新标定。", flush=True)
         return None
 
     walk_ended_mono = time.monotonic()
@@ -750,7 +782,11 @@ def calibrate_once(
         walk_started_mono,
         walk_ended_mono,
     )
-    integrated = integrate_walk(walk_samples, walk_s) if walk_samples else None
+    integration_span_s = (
+        walk_samples[-1]["timestamp_s"] - walk_samples[0]["timestamp_s"]
+        if len(walk_samples) >= 2 else 0.0
+    )
+    integrated = integrate_walk(walk_samples, integration_span_s) if walk_samples else None
     if integrated is None:
         print("iPhone 标定失败：向前走样本不足")
         return None
@@ -766,7 +802,7 @@ def calibrate_once(
         f"horizontal={horizontal_m:.4f} m",
         flush=True,
     )
-    forward_quality = forward_walk_quality(walk_samples, walk_s)
+    forward_quality = anchored_forward_walk_quality(walk_samples)
     if not forward_quality["ok"]:
         reasons = "；".join(forward_quality["errors"])
         print(f"iPhone 标定失败：前向走质量不通过（{reasons}）", flush=True)
@@ -798,8 +834,8 @@ def calibrate_once(
         results[source] = item
     print(
         f"iPhone 标定通过：水平 {horizontal_m:.2f} m，沿向上轴 {vertical_m:.2f} m；"
-        f"前后段方向差 {forward_quality['direction_stability']['angle_deg']:.1f}°，"
-        f"窗口敏感性 {forward_quality['window_sensitivity']['max_angle_deg']:.1f}°；"
+        f"终点姿态差 {forward_quality['endpoint_orientation_change_deg']:.1f}°，"
+        f"静止边界窗口敏感性 {forward_quality['window_sensitivity_max_deg']:.1f}°；"
         "Apple Watch 复用 iPhone R_MI。",
         flush=True,
     )
@@ -817,8 +853,12 @@ def calibrate_once(
                 "forward_walk": {
                     "start_unix_s": walk_started_unix,
                     "end_unix_s": walk_ended_unix,
-                    "requested_duration_s": walk_s,
+                    "requested_duration_s": walk_measured_s,
                     "measured_duration_s": walk_measured_s,
+                    "moving_requested_duration_s": walk_s,
+                    "integration_span_s": integration_span_s,
+                    "stationary_start_s": FORWARD_ANCHOR_START_S,
+                    "stationary_end_s": FORWARD_ANCHOR_END_S,
                 },
             },
             {
@@ -1187,11 +1227,11 @@ def rotation_difference_deg(left: torch.Tensor, right: torch.Tensor) -> float:
 
 
 def forward_walk_quality(samples: list[dict], walk_s: float) -> dict:
-    """Measure whether iPhone forward-walk calibration is well conditioned.
+    """Legacy diagnostic for walks without confirmed stationary endpoints.
 
-    The full window supplies the accepted R_MI.  Two overlapping 75%-length
-    portions test whether its direction changes during the walk.  Four small
-    inward trims test sensitivity to plausible receipt-window boundaries.
+    The early/late estimates assume zero velocity at boundaries that may lie
+    inside a stride.  Keep this only for historical audits, not for accepting
+    new calibrations.
     """
     ordered = sorted(samples, key=lambda item: item["timestamp_s"])
     if len(ordered) < 2:
@@ -1296,6 +1336,125 @@ def forward_walk_quality(samples: list[dict], walk_s: float) -> dict:
             },
         },
         "minimum_horizontal_distance_m": MIN_FORWARD_DISTANCE_M,
+    }
+
+
+def stationary_anchor_quality(samples: list[dict]) -> dict:
+    """Check that the phone was still at one end of a calibration walk."""
+    if len(samples) < 10:
+        return {"ok": False, "sample_count": len(samples), "reason": "too few still samples"}
+    mean_ris = average_ris(samples)
+    if mean_ris is None:
+        return {"ok": False, "sample_count": len(samples), "reason": "no mean orientation"}
+    pose = npose_quality(samples, mean_ris)
+    gyro_rms = math.sqrt(sum(
+        sum(float(sample["raw_values"].get(f"rotation_{axis}_rad_s", 0.0)) ** 2
+            for axis in "xyz")
+        for sample in samples
+    ) / len(samples))
+    reasons = []
+    if pose["acceleration_rms_m_s2"] > MAX_ANCHOR_ACCEL_RMS_M_S2:
+        reasons.append("acceleration above stationary limit")
+    if gyro_rms > MAX_ANCHOR_GYRO_RMS_RAD_S:
+        reasons.append("rotation rate above stationary limit")
+    if pose["max_orientation_deviation_deg"] > MAX_NPOSE_ORIENTATION_DEG:
+        reasons.append("orientation changed during stationary anchor")
+    return {
+        "ok": not reasons,
+        "sample_count": len(samples),
+        "acceleration_rms_m_s2": pose["acceleration_rms_m_s2"],
+        "gyro_rms_rad_s": gyro_rms,
+        "max_orientation_deviation_deg": pose["max_orientation_deviation_deg"],
+        "reasons": reasons,
+    }
+
+
+def anchored_forward_walk_quality(samples: list[dict]) -> dict:
+    """Validate a walk with verified stillness at both integration boundaries."""
+    ordered = sorted(samples, key=lambda item: item["timestamp_s"])
+    if len(ordered) < 20:
+        return {"ok": False, "errors": ["forward-walk samples are insufficient"]}
+    start_t, end_t = ordered[0]["timestamp_s"], ordered[-1]["timestamp_s"]
+    start = [sample for sample in ordered if sample["timestamp_s"] <= start_t + 0.45]
+    end = [sample for sample in ordered if sample["timestamp_s"] >= end_t - 0.60]
+    start_quality = stationary_anchor_quality(start)
+    end_quality = stationary_anchor_quality(end)
+    max_sample_gap_s = max(
+        right["timestamp_s"] - left["timestamp_s"]
+        for left, right in zip(ordered, ordered[1:])
+    )
+    if start_quality["ok"] and end_quality["ok"]:
+        adaptive_end_accel_limit = min(
+            MAX_ANCHOR_ACCEL_RMS_M_S2,
+            start_quality["acceleration_rms_m_s2"] * 2.0 + 0.3,
+        )
+        if end_quality["acceleration_rms_m_s2"] > adaptive_end_accel_limit:
+            end_quality["ok"] = False
+            end_quality["reasons"].append("acceleration exceeds start-anchor noise level")
+        end_quality["adaptive_acceleration_limit_m_s2"] = adaptive_end_accel_limit
+    full = integrate_walk(ordered, end_t - start_t)
+    if full is None:
+        return {"ok": False, "errors": ["could not integrate full walk"]}
+    position, velocity, duration_s = full
+    built = rmi_from_displacement(position - 0.5 * duration_s * velocity)
+    distance = float(built[1]) if built is not None else 0.0
+    first_ris, last_ris = average_ris(start), average_ris(end)
+    pose_change = (
+        rotation_difference_deg(first_ris, last_ris)
+        if first_ris is not None and last_ris is not None else None
+    )
+    variations = {}
+    for trim_start, trim_end, label in (
+        (FORWARD_STABILITY_TRIM_S, 0.0, "trim_start"),
+        (0.0, FORWARD_STABILITY_TRIM_S, "trim_end"),
+        (FORWARD_STABILITY_TRIM_S, FORWARD_STABILITY_TRIM_S, "trim_both"),
+    ):
+        selected = [sample for sample in ordered
+                    if start_t + trim_start <= sample["timestamp_s"] <= end_t - trim_end]
+        integrated = (
+            integrate_walk(selected, selected[-1]["timestamp_s"] - selected[0]["timestamp_s"])
+            if len(selected) >= 2 else None
+        )
+        if integrated is None or built is None:
+            continue
+        p, v, duration = integrated
+        alternative = rmi_from_displacement(p - 0.5 * duration * v)
+        if alternative is not None:
+            variations[label] = {
+                "angle_from_full_deg": rotation_difference_deg(built[0], alternative[0]),
+                "horizontal_m": float(alternative[1]),
+            }
+    max_sensitivity = max((v["angle_from_full_deg"] for v in variations.values()), default=None)
+    errors = []
+    if not start_quality["ok"]:
+        errors.append("start of forward walk was not stationary")
+    if not end_quality["ok"]:
+        errors.append("end of forward walk was not stationary")
+    if max_sample_gap_s > MAX_FORWARD_SAMPLE_GAP_S:
+        errors.append(f"forward-walk sample gap {max_sample_gap_s:.3f} s is too large")
+    if distance < MIN_ANCHORED_FORWARD_DISTANCE_M:
+        errors.append(f"horizontal displacement {distance:.3f} m is below {MIN_ANCHORED_FORWARD_DISTANCE_M:.3f} m")
+    if pose_change is None or pose_change > MAX_ANCHOR_ORIENTATION_CHANGE_DEG:
+        errors.append(f"phone changed orientation at the endpoint: {pose_change} deg")
+    if len(variations) != 3 or max_sensitivity > MAX_ANCHORED_WINDOW_SENSITIVITY_DEG:
+        errors.append(f"stationary-boundary window sensitivity: {max_sensitivity} deg")
+    return {
+        "ok": not errors,
+        "method": "stationary_anchored_forward_walk_v2",
+        "errors": errors,
+        "horizontal_m": distance,
+        "start_stationary": start_quality,
+        "end_stationary": end_quality,
+        "max_sample_gap_s": max_sample_gap_s,
+        "endpoint_orientation_change_deg": pose_change,
+        "window_sensitivity_max_deg": max_sensitivity,
+        "window_variations": variations,
+        "limits": {
+            "min_horizontal_m": MIN_ANCHORED_FORWARD_DISTANCE_M,
+            "max_endpoint_orientation_change_deg": MAX_ANCHOR_ORIENTATION_CHANGE_DEG,
+            "max_window_sensitivity_deg": MAX_ANCHORED_WINDOW_SENSITIVITY_DEG,
+            "max_sample_gap_s": MAX_FORWARD_SAMPLE_GAP_S,
+        },
     }
 
 
@@ -1452,10 +1611,20 @@ def calibrate_from_files(
         selected = compute_device_calibration(
             window_npose_samples,
             window_walk_samples,
-            walk_end - walk_start,
+            float(capture["windows"]["forward_walk"].get("integration_span_s", walk_end - walk_start)),
             coverage,
             "PC Unix time window fallback",
         )
+        if capture.get("live_iphone_calibration", {}).get("forward_walk_quality", {}).get(
+            "method"
+        ) == "stationary_anchored_forward_walk_v2":
+            anchored_quality = anchored_forward_walk_quality(window_walk_samples)
+            if not anchored_quality["ok"]:
+                raise CalibrationError(
+                    "offline iPhone stationary-anchored calibration failed: "
+                    + "; ".join(anchored_quality["errors"])
+                )
+            selected["forward_walk_quality"] = anchored_quality
         live_rmi_value = capture.get("live_iphone_calibration", {}).get("R_MI")
         if live_rmi_value is not None:
             live_rmi = torch.tensor(live_rmi_value, dtype=selected["R_MI"].dtype)
@@ -1471,7 +1640,10 @@ def calibrate_from_files(
         )
         requested_walk_s = float(
             capture["windows"]["forward_walk"].get(
-                "requested_duration_s", walk_end - walk_start
+                "integration_span_s",
+                capture["windows"]["forward_walk"].get(
+                    "requested_duration_s", walk_end - walk_start
+                ),
             )
         )
         selected = compute_device_calibration(
@@ -1488,6 +1660,16 @@ def calibrate_from_files(
             "saved online calibration trace",
             "saved online raw-value replay",
         )
+        if capture.get("live_iphone_calibration", {}).get("forward_walk_quality", {}).get(
+            "method"
+        ) == "stationary_anchored_forward_walk_v2":
+            anchored_quality = anchored_forward_walk_quality(exact_walk)
+            if not anchored_quality["ok"]:
+                raise CalibrationError(
+                    "offline iPhone stationary-anchored calibration failed: "
+                    + "; ".join(anchored_quality["errors"])
+                )
+            selected["forward_walk_quality"] = anchored_quality
         comparison.update(
             {
                 "selection_method": "explicit_event_identity",
@@ -1595,9 +1777,9 @@ def calibrate_from_files(
                     "npose_sample_count": selected["npose_sample_count"],
                     "walk_sample_count": selected["walk_sample_count"],
                     "npose_quality": selected["npose_quality"],
-                    "forward_walk_quality": capture.get("live_iphone_calibration", {}).get(
-                        "forward_walk_quality"
-                    ),
+                    "forward_walk_quality": selected.get("forward_walk_quality") or capture.get(
+                        "live_iphone_calibration", {}
+                    ).get("forward_walk_quality"),
                     "sample_selection_method": comparison["selection_method"],
                     "r_mi_comparison": comparison,
                 }
@@ -1813,6 +1995,32 @@ def finalize_offline_capture(args: argparse.Namespace) -> None:
     )
     save_merged_raw(directory / "raw.ndjson", events)
 
+    live_forward_quality = capture.get("live_iphone_calibration", {}).get("forward_walk_quality")
+    calibration_acceptance = {
+        "source": CALIBRATION_SOURCE,
+        "watch_uses_iphone_r_mi": True,
+        "max_npose_orientation_deviation_deg": MAX_NPOSE_ORIENTATION_DEG,
+        "max_npose_acceleration_rms_m_s2": MAX_NPOSE_ACCEL_RMS_M_S2,
+        "forward_window_trim_s": FORWARD_STABILITY_TRIM_S,
+    }
+    if isinstance(live_forward_quality, dict) and live_forward_quality.get("method") == "stationary_anchored_forward_walk_v2":
+        calibration_acceptance.update({
+            "method": "stationary_anchored_forward_walk_v2",
+            "min_forward_distance_m": MIN_ANCHORED_FORWARD_DISTANCE_M,
+            "max_endpoint_orientation_change_deg": MAX_ANCHOR_ORIENTATION_CHANGE_DEG,
+            "max_forward_window_sensitivity_deg": MAX_ANCHORED_WINDOW_SENSITIVITY_DEG,
+            "max_anchor_acceleration_rms_m_s2": MAX_ANCHOR_ACCEL_RMS_M_S2,
+            "max_anchor_gyro_rms_rad_s": MAX_ANCHOR_GYRO_RMS_RAD_S,
+            "max_forward_sample_gap_s": MAX_FORWARD_SAMPLE_GAP_S,
+        })
+    else:
+        calibration_acceptance.update({
+            "method": "legacy_forward_walk",
+            "min_forward_distance_m": MIN_FORWARD_DISTANCE_M,
+            "max_forward_direction_change_deg": MAX_FORWARD_DIRECTION_CHANGE_DEG,
+            "max_forward_window_sensitivity_deg": MAX_FORWARD_WINDOW_SENSITIVITY_DEG,
+        })
+
     quality = {
         "schema_version": 1,
         "capture_mode": "device_local_files",
@@ -1823,19 +2031,8 @@ def finalize_offline_capture(args: argparse.Namespace) -> None:
         "action_window": {"start_unix_s": action_start, "end_unix_s": action_end},
         "output_fps": fps,
         "output_frame_count": int(grid["aS"].shape[0]),
-        "calibration_acceptance": {
-            "source": CALIBRATION_SOURCE,
-            "watch_uses_iphone_r_mi": True,
-            "max_npose_orientation_deviation_deg": MAX_NPOSE_ORIENTATION_DEG,
-            "max_npose_acceleration_rms_m_s2": MAX_NPOSE_ACCEL_RMS_M_S2,
-            "min_forward_distance_m": MIN_FORWARD_DISTANCE_M,
-            "max_forward_direction_change_deg": MAX_FORWARD_DIRECTION_CHANGE_DEG,
-            "max_forward_window_sensitivity_deg": MAX_FORWARD_WINDOW_SENSITIVITY_DEG,
-            "forward_window_trim_s": FORWARD_STABILITY_TRIM_S,
-        },
-        "live_forward_walk_quality": capture.get("live_iphone_calibration", {}).get(
-            "forward_walk_quality"
-        ),
+        "calibration_acceptance": calibration_acceptance,
+        "live_forward_walk_quality": live_forward_quality,
         "r_mi_comparison": calibration[CALIBRATION_SOURCE].get("r_mi_comparison"),
         "watch_independent_calibration": {
             "status": calibration["apple_watch"].get(
@@ -2598,6 +2795,24 @@ def run_self_test() -> None:
         raise AssertionError(
             f"stable synthetic forward walk should pass quality checks: {synthetic_forward_quality}"
         )
+    anchored_samples = []
+    for frame in range(89):
+        timestamp_s = frame / 20.0
+        acceleration = 1.0 if 0.6 <= timestamp_s < 2.1 else -1.0 if 2.1 <= timestamp_s < 3.6 else 0.0
+        sample = copy.deepcopy(synthetic_motion[CALIBRATION_SOURCE][0])
+        sample["timestamp_s"] = timestamp_s
+        sample["timestamp_unix_ns"] = int(timestamp_s * 1_000_000_000)
+        sample["sequence"] = frame
+        sample["aI"][0] = acceleration
+        sample["aS"][0] = acceleration
+        sample["raw_values"]["user_accel_x_g"] = acceleration / GRAVITY
+        anchored_samples.append(sample)
+    anchored_quality = anchored_forward_walk_quality(anchored_samples)
+    if not anchored_quality["ok"]:
+        raise AssertionError(f"stationary-anchored walk should pass: {anchored_quality}")
+    still_moving_quality = anchored_forward_walk_quality(anchored_samples[:69])
+    if still_moving_quality["ok"] or still_moving_quality["end_stationary"]["ok"]:
+        raise AssertionError("walk ending during motion must fail the endpoint check")
     trace_source = synthetic_motion[CALIBRATION_SOURCE]
     trace = {
         "npose": [
@@ -2665,6 +2880,54 @@ def run_self_test() -> None:
         raise AssertionError("exact live-event matching count is incorrect")
     if exact_comparison["online_saved_vs_offline_exact_deg"] > 1e-3:
         raise AssertionError("exact offline calibration did not reproduce online R_MI")
+    v2_motion = {}
+    for source in DEVICES:
+        npose = [copy.deepcopy(sample) for sample in synthetic_motion[source]
+                 if 1.0 <= sample["timestamp_s"] <= 2.95]
+        shifted_walk = []
+        for sample in anchored_samples:
+            shifted = copy.deepcopy(sample)
+            shifted["source"] = source
+            shifted["timestamp_s"] += 3.1
+            shifted["timestamp_unix_ns"] += 3_100_000_000
+            shifted["sequence"] += 1000
+            shifted_walk.append(shifted)
+        v2_motion[source] = npose + shifted_walk
+    v2_trace = {}
+    for phase, records in (("npose", v2_motion[CALIBRATION_SOURCE][:40]),
+                           ("forward_walk", v2_motion[CALIBRATION_SOURCE][40:])):
+        v2_trace[phase] = [
+            {
+                "phase": phase,
+                "source": CALIBRATION_SOURCE,
+                "sensor": "device_motion",
+                "sessionID": sample["session_id"],
+                "sequenceNumber": sample["sequence"],
+                "timestampUnixNs": sample["timestamp_unix_ns"],
+                "receivedUnixS": sample["timestamp_s"],
+                "values": sample["raw_values"],
+            }
+            for sample in records
+        ]
+    v2_capture = {
+        "windows": {
+            "npose": {"start_unix_s": 1.0, "end_unix_s": 2.95},
+            "forward_walk": {"start_unix_s": 3.1, "end_unix_s": 7.5,
+                             "integration_span_s": 4.4},
+        },
+        "live_iphone_calibration": {
+            "forward_walk_quality": anchored_quality,
+        },
+    }
+    v2_reference = compute_device_calibration(
+        v2_motion[CALIBRATION_SOURCE][:40],
+        v2_motion[CALIBRATION_SOURCE][40:],
+        4.4, "self-test v2", "self-test v2",
+    )
+    v2_capture["live_iphone_calibration"]["R_MI"] = v2_reference["R_MI"].tolist()
+    v2_calibration = calibrate_from_files(v2_motion, v2_capture, first, live_trace=v2_trace)
+    if v2_calibration[CALIBRATION_SOURCE]["r_mi_comparison"]["online_saved_vs_offline_exact_deg"] > 1e-3:
+        raise AssertionError("stationary-anchored offline replay changed R_MI")
     session_test_capture = {
         "expected_session_ids": ["self-test-session", ""],
         "live_iphone_calibration": {
