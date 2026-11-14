@@ -138,6 +138,25 @@ python livedemo_apple.py --subject libo1_0901 --name 001
 
 详见 [Apple 接入说明](mobileposer/APPLE_MOCAP.md)。
 
+### Apple 离线 walking calibration
+
+无需在线传输：读取一次采集的手机/手表 NDJSON，将 IMU、独立 raw 传感器和 UWB
+对齐到共同时间轴（默认 50 Hz），自动寻找“N-pose 静止 → 向前迈步 → 同姿态静止”，
+计算每个设备的 `RMI` / `RSB`，输出对齐后的数组及原始采样率副本。
+自动检测遇到缺失或歧义会拒绝，不会强行输出参数。
+
+```bash
+# 在 mobileposer 目录、mobileposer conda 环境中运行
+python apple_offline_calibration.py /path/to/session_folder \
+  --fps 50 --output data/offline_calibration/my_session
+```
+
+默认 Watch 左腕、iPhone 右口袋。输入支持旧版合并 NDJSON 和新版分设备文件；
+原文件不修改。详细参数、输出字段、历史结果对比及局限见
+[离线校准说明](mobileposer/APPLE_OFFLINE_CALIBRATION.md)。
+统一时间轴、`RIS/RSI`、时钟偏移/漂移、缺失 mask、UWB 有效期和 NPZ 字段说明见
+[多模态对齐说明](mobileposer/APPLE_OFFLINE_ALIGNMENT.md)。同一网格不等于设备已经精确对时。
+
 ## 华为设备动作捕捉
 
 启动传感器发送端和 Unity MotionViewer 后运行：
