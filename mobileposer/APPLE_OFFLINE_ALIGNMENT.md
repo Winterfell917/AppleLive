@@ -6,6 +6,7 @@
 
 ```bash
 python apple_offline_calibration.py /path/to/session_folder \
+  --watch-placement right_wrist --phone-placement left_thigh_pocket \
   --fps 50 --output data/offline_calibration/session_001
 ```
 
@@ -13,8 +14,16 @@ python apple_offline_calibration.py /path/to/session_folder \
 `raw.ndjson`，或依次指定手机和手表两个 NDJSON。支持中文/空格路径（命令行加引号）。
 输出目录必须为空。App 和原始记录不改变，不需要联网、UDP、模型权重或真机。
 
-默认手机右口袋/右大腿 slot 3，Watch 左腕 slot 0；顺序以输出 `source_names` 为准，
-不要假设第 0 列是手机。可通过重复 `--source-slot` 改身体位置或添加 AirPods。
+可选 Watch 左/右腕，手机左/右手或左/右大腿口袋，包含同侧戴表并持手机的组合。
+用 `--watch-placement` + `--phone-placement` 明确声明（完整选项与采集姿态见
+[位置说明](APPLE_OFFLINE_CALIBRATION.md)）。旧命令未传位置时
+仍假定 Watch 左腕 slot 0、手机右口袋 slot 3，报告会警告；不自动猜测佩戴位置。
+顺序以输出 `source_names` 为准，不要假设第 0 列是手机。
+高级 `--source-slot` 可添加 AirPods，但物理位置标签记为 `unspecified`，不能与命名位置混用。
+
+位置每段可以不同，同段内必须保持安装/握法不变。改变位置选项影响目标 N-pose、
+`RSB` 及身体坐标变换，不改变原始 `RIS/RSI`、时间映射、重采样或 UWB 距离。
+RMI 由向前运动估计，与位置槽位选择无关；两设备仍分别估计自己的 RMI。
 
 流程：**读取 → 时钟映射 → 统一网格 → 校准区间检测 → RMI/RSB → 转换全部网格数据**。
 输出包含校准片段；`after_calibration` 标记校准结束后的运动，不默认丢掉前段。
@@ -117,6 +126,9 @@ UWB 的 app 回调时间也不等同于已知的硬件测量时刻。
 | `timestamp_unix_ns` | `[T] int64` | 同一参考时间轴的网格纳秒时间戳；默认每 20,000,000 ns 一帧 |
 | `time_relative_s` | `[T]` | 相对于网格首帧的秒数 |
 | `source_names/source_slots` | `[S]` | 设备列名与身体槽位 |
+| `source_placements/source_target_frames` | `[S]` 字符串 | 位置标签 / 目标坐标（手机手持为 wrist proxy），与设备列顺序一致 |
+| `placement_selection` | 字符串标量 | `explicit` / `legacy_defaults_assumed` / `numeric_slots_unspecified` |
+| `legacy_slot_export_available` | bool 标量 | 是否槽位唯一、可无冲突导出旧 7 槽格式；不是模型适配声明 |
 | `user_acc_S_m_s2` | `[T,S,3]` | 仓库 S 轴中的去重力加速度，m/s² |
 | `gyro_S_rad_s` | `[T,S,3]` | 仓库 S 轴中的融合角速度，rad/s |
 | `RIS/RSI` | `[T,S,3,3]` | 每帧传感器↔惯性旋转 |
@@ -138,19 +150,24 @@ UWB 的 app 回调时间也不等同于已知的硬件测量时刻。
 | `uwb_measurement_aligned_unix_ns` | `[T,S] int64` | 同一测量映射到共同时钟后的时间 |
 | `uwb_sequence_number` | `[T,S] int64` | 被选测量序号；没有历史样本时 -1 |
 | `uwb_direction_local/uwb_direction_valid` | `[T,S,3]` / `[T,S]` | 可选 UWB 本地方向及有效性 |
-| `RMI/RSB` | `[S,3,3]` | 固定空间校准参数；JSON 文件仍采用原仓库的 7 槽格式 |
+| `RMI/RSB` | `[S,3,3]` | 按设备独立保存的固定参数；JSON schema 2 的权威参数为 `source_calibration[设备]` |
 | `acc_M_m_s2/gyro_B_rad_s` | `[T,S,3]` | 模型轴加速度 / 身体部位轴角速度 |
 | `ori_MB` | `[T,S,3,3]` | 身体部位→模型旋转 |
 | `after_calibration` | `[T] bool` | 最后静止校准窗口结束之后的帧 |
 
 无效网格点仍可能保留用于诊断的 bracket/最近 UWB 样本信息，**必须以 valid mask 为准**。
 高频原始 UWB 多个样本可能落入同一个网格间隔；网格只持有最新一个，完整样本见 native archive。
+同侧戴表并持手机时 `source_slots` 可以重复，**不能按槽位覆盖/合并设备列**。
+这时 JSON 顶层旧 7 槽 `RMI/RSB` 为 `null`，而 `source_calibration` 与 NPZ 中的
+`[S,3,3]` 参数完整可用。槽位不重复时仍额外导出旧 7 槽矩阵供兼容读取。
+位置元信息同时保存在两个 aligned NPZ、native archive、alignment/calibration/quality JSON 中。
 
 ```python
 import numpy as np
 x = np.load("data/offline_calibration/session_001/aligned_calibrated.npz", allow_pickle=False)
 phone = x["source_names"].tolist().index("iphone")
 watch = x["source_names"].tolist().index("apple_watch")
+print(x["source_placements"].tolist(), x["source_target_frames"].tolist())
 keep = x["after_calibration"] & x["joint_motion_valid"]
 times = x["timestamp_unix_ns"][keep]
 acc = x["acc_M_m_s2"][keep]        # [T_valid, 2, 3]

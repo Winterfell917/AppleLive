@@ -3,7 +3,8 @@
 ## 目的与边界
 
 入口是 `apple_offline_calibration.py`；计算、数据读取、检测、绘图在
-`sensor_apple/offline.py`；多模态时间对齐在 `sensor_apple/alignment.py`；测试在 `../tests/`。
+`sensor_apple/offline.py`；位置标签/槽位兼容在 `sensor_apple/placements.py`；
+多模态时间对齐在 `sensor_apple/alignment.py`；测试在 `../tests/`。
 不启动 UDP、不需要连接设备、不加载动作识别/姿态模型，不修改采集 App。
 
 自动流程：读取同一次采集的 NDJSON → 应用时钟映射 → 各模态对齐到共同网格（默认 50 Hz）
@@ -18,14 +19,44 @@
 
 ## 采集约定
 
-1. 默认 Watch 戴左腕、iPhone 放右口袋/右大腿；开始后固定设备，不再调整佩戴。
-2. 面向前方站立，保持 N-pose（双臂自然下垂）约 3 秒。
-3. 向正前方迈一步，站稳并回到同样的 N-pose；再静止约 3 秒。
+1. 每段明确记录位置：Watch 左/右腕，iPhone 左/右手或左/右大腿口袋，任意组合。
+   开始后固定佩戴/握法；不要求不同序列始终使用同一位置。
+2. 面向前方站立，保持 N-pose（双臂自然下垂）约 3 秒；持手机时手腕保持中立位。
+3. 向正前方迈一步，校准步中尽量减少额外挥手/手腕转动，站稳并回到同样的 N-pose；再静止约 3 秒。
 4. 开始后续活动。校准动作与普通活动之间留出清楚的停顿。
 
 程序可以检测运动/静止，但不能单靠这些信号证明“这是 N-pose”或“走的是正前方”。
 转身、侧迈、挪动手机、挥手、重启 CoreMotion 参考系均会破坏假设。
 一个固定 `RSB` 也不能补偿后续手机在口袋中持续滑动。
+**同一序列中途换手、换口袋或明显改变握法，需要分段并重新校准。**
+此版本不自动识别位置，也不自动检测/修复设备安装变化。
+
+## 位置选择：2 × 4 种组合
+
+| 设备 | 参数值 | 对应旧模型槽位/坐标约定 |
+| --- | --- | --- |
+| Watch 左腕 / 右腕 | `--watch-placement left_wrist` / `right_wrist` | 0 / 1，各自使用对应左右腕 N-pose 矩阵 |
+| iPhone 左手 / 右手 | `--phone-placement left_hand` / `right_hand` | 0 / 1，明确标记为 wrist-frame proxy（腕部坐标近似） |
+| iPhone 左 / 右大腿口袋 | `--phone-placement left_thigh_pocket` / `right_thigh_pocket` | 2 / 3 |
+
+两个位置参数必须一起指定，不与 `--source-slot` 混用。旧命令不指定参数时仍按
+左腕手表 + 右大腿口袋运行，但会提示假定位置，报告写入 `legacy_defaults_assumed`；
+推荐新数据每次明确写全两个位置。高级 `--source-slot` 继续支持其它设备/槽位，
+但只声明数值槽位，不等于已记录物理位置，会标记 `numeric_slots_unspecified`。
+
+手机持于手中，不等价于手表固定在腕/前臂：即使使用相同槽位约定，手腕活动也会
+造成手部与前臂运动不同。因此其 `target_frame` 为 `left_wrist_proxy` / `right_wrist_proxy`，
+不是对真实骨骼姿态准确度的保证。N-pose 时保持手腕中立，随后握法稳定。
+
+支持同侧戴表并持手机（例如左腕手表 + 左手手机）：参数按 `source` 独立保存，
+不会合并、平均或覆盖。此时不能一对一装进旧 7 槽模型张量，旧槽位矩阵导出会禁用，
+仍完整生成以设备为维度的对齐/校准结果。UWB 保持设备间实测距离，不转换成骨骼关节距离；
+设备都在同侧手附近时，对全身姿态的几何约束也与腕—大腿组合不同。
+
+**校准/导出支持这些位置，不代表现有模型已经训练或验证过这些组合。**
+仓库 `config.py` 的 `amass.combos_full` 及 `livedemo_apple.py` 的
+`CALIBRATOR_COMBO` 仍使用 `[0,3,4]`；在线接收器仍要求槽位唯一。
+本次只扩展离线工具，没有修改在线模型、App、网络传输或给出新组合的准确率承诺。
 
 ## 运行
 
@@ -35,11 +66,14 @@ cd /Users/zhanglb/WorkSpace/research/project/MocapPipe/mobileposer
 
 # 推荐：一次采集的子文件夹，自动读取该层的 *.ndjson，不递归遍历其它序列
 python apple_offline_calibration.py /path/to/session_folder \
+  --watch-placement right_wrist --phone-placement left_thigh_pocket \
   --fps 50 --output data/offline_calibration/session_001
 
 # 也可以指定分设备文件，或一个旧版合并文件 raw.ndjson
 python apple_offline_calibration.py /path/to/iphone-events.ndjson \
-  /path/to/apple_watch-events.ndjson --output data/offline_calibration/session_002
+  /path/to/apple_watch-events.ndjson \
+  --watch-placement left_wrist --phone-placement left_hand \
+  --output data/offline_calibration/session_002
 
 # 可选第三设备；指定 source-slot 时需要写全本次要用的设备
 python apple_offline_calibration.py /path/to/session_folder \
@@ -86,7 +120,7 @@ python apple_offline_calibration.py /path/to/session_folder \
 | `aligned_sensors.npz` | 未进行空间校准的统一时间轴数据，含 `RIS`/`RSI` 与原始样本配对信息 |
 | `alignment.json` | 时钟模型、网格 FPS、过滤方法、有效帧比例、UWB 保持策略 |
 | `native_modalities.npz` | 所选模态的原始时间戳/序号/采样率副本，UWB 原始样本完整保留；motion 数值已按仓库约定转换坐标/单位 |
-| `calibration.json` | 兼容原仓库的 7×3×3 `RMI`/`RSB`、槽位、sessionID、窗口、偏移、坐标约定；未用槽位为单位矩阵，使用时必须结合 `source_slots` |
+| `calibration.json` | schema 2：权威参数为 `source_calibration[设备].RMI/RSB`，另含位置标签、槽位、sessionID、窗口、时钟和坐标约定。槽位唯一时额外导出旧 7×3×3 矩阵，槽位重复时旧矩阵为 `null` |
 | `calibration_quality.json` | 检测结果、输入文件/采样率/缺口、静止程度、位移、方向敏感性、失败原因、可选历史对比 |
 | `diagnostic.png` | 各设备加速度/角速度 RMS、阈值、窗口；粉色虚线仅标记历史参考窗口 |
 | `iphone-calibrated.npz` | 手机最终静止窗口结束以后的转换数据，保留手机原始采样率 |
@@ -107,12 +141,30 @@ python apple_offline_calibration.py /path/to/session_folder \
 | `gyro_B_rad_s` | `[N,3]`，rad/s | 骨骼坐标中的角速度 |
 | `gap_before` | `[N] bool` | 此样本与前一输出样本间隔是否超过 max-gap；没有填补缺口 |
 | `source/session_id/slot` | 标量 | 数据源/采集 UUID/身体槽位 |
+| `placement/target_frame` | 字符串标量 | 实际声明位置 / 目标坐标约定（手持会标记 proxy） |
+| `RMI/RSB` | `[3,3]` | 当前设备独立的固定校准参数 |
 
 ```python
 import numpy as np
 x = np.load("data/offline_calibration/session_001/iphone-calibrated.npz")
 print(x["acc_M_m_s2"].shape, x["ori_MB"].shape)
 ```
+
+JSON 参数应优先按设备读取，而不是用槽位索引（同侧两设备可能同槽）：
+
+```python
+import json
+from pathlib import Path
+cal = json.loads(Path("data/offline_calibration/session_001/calibration.json").read_text())
+phone_rmi = np.array(cal["source_calibration"]["iphone"]["RMI"])
+phone_rsb = np.array(cal["source_calibration"]["iphone"]["RSB"])
+print(cal["placement"]["source_placements"])
+print(cal["placement"]["legacy_slot_export_available"])
+```
+
+槽位唯一时旧 `RMI/RSB[7,3,3]` 的未用槽位仍是单位矩阵，须结合 `source_slots`。
+`legacy_slot_export_available` 只表示可以无冲突导出，不表示模型支持该组合。
+历史对比仍可读取只有 7 槽矩阵的旧 JSON；无法确认旧文件物理位置时报告警告。
 
 默认网格校准保存 `grid_indices`、网格纳秒时间戳、完整时钟模型，并在对齐数组中保留
 原始插值样本对的时间戳/序号；使用 native 模式时保存原始样本序号，便于准确复现。

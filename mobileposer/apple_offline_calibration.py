@@ -8,18 +8,23 @@ from pathlib import Path
 
 import numpy as np
 
-from sensor_apple.offline import (CalibrationError, Config, DEFAULT_SLOTS, apply_calibration,
+from sensor_apple.offline import (CalibrationError, Config, apply_calibration,
                                 auto_calibrate, calibration, canonical, compare,
                                 diagnostic_plot, input_paths, load_motion, replay_reference)
 from sensor_apple.alignment import (build_aligned, calibrated_arrays, clock_models, grid_motions,
                                     load_auxiliary, mapped_motions, save_native_archive)
+from sensor_apple.placements import (PHONE_PLACEMENTS, WATCH_PLACEMENTS, describe_placements,
+                                     placement_arrays, resolve_placements)
 
 
 def mapping(items, cast):
     result = {}
     for item in items or []:
         key, value = item.split(":", 1)
-        result[canonical(key)] = cast(value)
+        key = canonical(key)
+        if key in result:
+            raise ValueError(f"Duplicate source override: {key}")
+        result[key] = cast(value)
     return result
 
 
@@ -31,7 +36,9 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("inputs", nargs="+", help="One session folder or one/more NDJSON files (merged or split)")
     p.add_argument("--output", required=True, type=Path, help="New/empty output directory; originals are never overwritten")
-    p.add_argument("--source-slot", action="append", help="e.g. iphone:3; default Watch:0 + iPhone:3")
+    p.add_argument("--source-slot", action="append", help="Advanced numeric mapping, e.g. iphone:3; physical placement remains unspecified")
+    p.add_argument("--watch-placement", choices=WATCH_PLACEMENTS, help="Specify together with --phone-placement")
+    p.add_argument("--phone-placement", choices=PHONE_PLACEMENTS, help="Specify together with --watch-placement; keep mounting/grip fixed within a segment")
     p.add_argument("--session-id")
     p.add_argument("--clock-offset", action="append", help="SOURCE:seconds to ADD to Unix time; default 0, not precise sync")
     p.add_argument("--clock-drift-ppm", action="append", help="SOURCE:ppm clock-rate correction, anchored to report origin")
@@ -59,7 +66,7 @@ def main(argv=None):
     manual = (args.static_window, args.walk_window, args.post_window)
     if any(x is not None for x in manual) and not all(x is not None for x in manual):
         p.error("Manual mode requires --static-window, --walk-window, and --post-window")
-    if args.replay_reference and (args.clock_offset or args.clock_drift_ppm or args.sync_anchors or args.alignment_only or args.source_slot or any(manual)):
+    if args.replay_reference and (args.clock_offset or args.clock_drift_ppm or args.sync_anchors or args.alignment_only or args.source_slot or args.watch_placement or args.phone_placement or any(manual)):
         p.error("Replay uses the reference's sources/offsets/windows; do not override them")
     if any(not math.isfinite(x) or x <= 0 for x in (args.search_seconds, args.static_seconds, args.static_acc_rms, args.static_gyro_rms, args.max_gap, args.uwb_max_age)) or not math.isfinite(args.search_start) or args.search_start < 0:
         p.error("Durations/thresholds must be positive; search-start must be nonnegative")
@@ -73,22 +80,33 @@ def main(argv=None):
     if output.exists() and any(output.iterdir()):
         p.error(f"Output is not empty: {output}; use a new directory")
     reference = json.loads(args.reference.read_text()) if args.reference else None
-    slots = reference["source_slots"] if args.replay_reference else (mapping(args.source_slot, int) or DEFAULT_SLOTS.copy())
-    if len(set(slots.values())) != len(slots) or any(v not in range(7) for v in slots.values()):
-        p.error("Body slots must be unique integers 0..6")
-    offsets = reference.get("clock_offset_s", {}) if args.replay_reference else mapping(args.clock_offset, float)
+    try:
+        if args.replay_reference:
+            slots = reference["source_slots"]
+            placement_info = reference.get("placement") or describe_placements(slots)
+        else:
+            slots, placement_info = resolve_placements(mapping(args.source_slot, int) if args.source_slot else None,
+                                                       args.watch_placement, args.phone_placement)
+        offsets = reference.get("clock_offset_s", {}) if args.replay_reference else mapping(args.clock_offset, float)
+    except ValueError as exc:
+        p.error(str(exc))
     if any(v is None or not math.isfinite(v) for v in offsets.values()) or set(offsets) - set(slots):
         p.error("Clock offsets must be finite and belong to selected sources")
     config = Config(search_start_s=args.search_start, search_seconds=args.search_seconds,
                     static_seconds=args.static_seconds, static_acc_rms=args.static_acc_rms,
                     static_gyro_rms=args.static_gyro_rms, max_gap_s=args.max_gap)
     output.mkdir(parents=True, exist_ok=True)
+    print("Placements: " + json.dumps(placement_info["source_placements"], ensure_ascii=False))
+    for warning in placement_info["warnings"]:
+        print("Warning: " + warning, file=sys.stderr)
     report = {"status": "failed", "parameters": asdict(config), "orientation_accuracy_verified": False,
               "warnings": ["Passing signal checks cannot prove an N-pose or forward walking direction.",
                            "Current sensor.py coordinate convention is preserved; this is not an independent physical-frame validation."],
               "assumptions": ["known N-pose before/after a forward step", "unchanged device mounting and CoreMotion reference frame",
                               "Unix timestamps provide approximate cross-device alignment, not guaranteed synchronization"],
               "reference": str(args.reference.resolve()) if args.reference else None}
+    report["placement"] = placement_info
+    report["warnings"].extend(placement_info["warnings"])
     motions, cal, native, aligned, clocks = None, None, None, None, None
     try:
         paths = input_paths(args.inputs)
@@ -101,7 +119,9 @@ def main(argv=None):
             aligned, alignment_report = build_aligned(native, streams, slots, clocks, args.fps, args.max_gap,
                                                       args.uwb_max_age, args.anti_alias == "auto")
             alignment_report.update(clocks=clock_report, input_files=[str(path) for path in paths], **aux_info)
-            save_native_archive(output / "native_modalities.npz", native, streams)
+            alignment_report["placement"] = placement_info
+            aligned.update(placement_arrays(placement_info, aligned["source_names"].tolist()))
+            save_native_archive(output / "native_modalities.npz", native, streams, placement_info)
             np.savez_compressed(output / "aligned_sensors.npz", **aligned)
             write_json(output / "alignment.json", alignment_report)
             report["alignment"] = {"report": "alignment.json", "fps": args.fps,
@@ -121,17 +141,17 @@ def main(argv=None):
             static, walk, post = [tuple(origin + v for v in w) for w in manual]
             if not (static[0] < static[1] <= walk[0] < walk[1] <= post[0] < post[1]):
                 raise CalibrationError("Manual windows must be ordered, positive-duration, non-overlapping")
-            cal, quality = calibration(motions, slots, static, walk, config, post)
+            cal, quality = calibration(motions, slots, static, walk, config, post, placement_info=placement_info)
             cal["offline_mode"] = "manual_native"
             detection = {"origin_timestamp_s": origin}
         else:
-            cal, quality, detection = auto_calibrate(motions, slots, config)
+            cal, quality, detection = auto_calibrate(motions, slots, config, placement_info)
         if not args.replay_reference:
             cal["clock_models"] = clock_report
             # Legacy constant-offset readers must not mistake an affine model for
             # a verified constant clock correction. clock_models is authoritative.
             cal["clock_offset_s"] = {s: clocks[s].offset_s for s in slots}
-            cal["offline_algorithm_version"] = 2
+            cal["offline_algorithm_version"] = 3
             cal["calibration_sampling"] = args.calibration_sampling
             cal["synchronization"].update(strategy="common_timestamp_grid" if args.calibration_sampling == "aligned" else "clock_mapped_native",
                                           fps=args.fps, interpolation=args.calibration_sampling == "aligned",

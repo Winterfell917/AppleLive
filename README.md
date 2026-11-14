@@ -148,10 +148,15 @@ python livedemo_apple.py --subject libo1_0901 --name 001
 ```bash
 # 在 mobileposer 目录、mobileposer conda 环境中运行
 python apple_offline_calibration.py /path/to/session_folder \
+  --watch-placement right_wrist --phone-placement left_thigh_pocket \
   --fps 50 --output data/offline_calibration/my_session
 ```
 
-默认 Watch 左腕、iPhone 右口袋。输入支持旧版合并 NDJSON 和新版分设备文件；
+支持 Watch 左/右腕与 iPhone 左/右手、左/右大腿口袋的全部 8 种组合，含同侧两设备。
+位置需显式声明，每个校准段内安装/握法固定；同段中途换位置需重新校准。
+手机手持使用腕部坐标近似并明确标注，不等价于前臂传感器，也不代表现有模型适配所有组合。
+参数按设备保存，避免同一身体槽位下相互覆盖；原始时间对齐/UWB 策略不变。
+不传位置参数的旧命令仍默认 Watch 左腕、iPhone 右口袋并提示。输入支持旧版合并 NDJSON 和新版分设备文件；
 原文件不修改。详细参数、输出字段、历史结果对比及局限见
 [离线校准说明](mobileposer/APPLE_OFFLINE_CALIBRATION.md)。
 统一时间轴、`RIS/RSI`、时钟偏移/漂移、缺失 mask、UWB 有效期和 NPZ 字段说明见

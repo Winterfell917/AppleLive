@@ -14,6 +14,7 @@ from scipy.ndimage import uniform_filter1d
 from scipy.spatial.transform import Rotation
 
 from .sensor import APPLE_LH_TO_RH, APPLE_I_UP_RH, GRAVITY, NPOSE_RMB
+from .placements import describe_placements, source_rotations
 
 C = APPLE_LH_TO_RH.numpy().astype(float)
 UP = APPLE_I_UP_RH.numpy().astype(float)
@@ -202,7 +203,10 @@ def rotation_from_forward(forward):
     return np.stack([x, UP, np.cross(x, UP)])
 
 
-def calibration(motions, slots, static, walk, config, post=None, paired=None):
+def calibration(motions, slots, static, walk, config, post=None, paired=None, placement_info=None):
+    placement_info = placement_info or describe_placements(slots)
+    if placement_info["source_slots"] != slots or set(motions) != set(slots):
+        raise CalibrationError("Placement/source mapping does not match the motion data")
     if not paired:
         if static[1] - static[0] < config.static_seconds - 1e-6:
             raise CalibrationError("Initial static window is too short")
@@ -210,6 +214,7 @@ def calibration(motions, slots, static, walk, config, post=None, paired=None):
             raise CalibrationError("Final static window is too short")
     rmi = np.repeat(np.eye(3)[None], 7, axis=0)
     rsb = rmi.copy()
+    per_source = {}
     quality = {}
     for source, m in motions.items():
         si = paired[0][source] if paired else indices(m, static, config.max_gap_s)
@@ -221,8 +226,11 @@ def calibration(motions, slots, static, walk, config, post=None, paired=None):
         if distance < limit:
             raise CalibrationError(f"{source}: horizontal displacement {distance:.4f}m < {limit}m")
         slot = slots[source]
-        rmi[slot] = rotation_from_forward(d)
-        rsb[slot] = (rmi[slot] @ n).T @ NPOSE[slot]
+        source_rmi = rotation_from_forward(d)
+        source_rsb = (source_rmi @ n).T @ NPOSE[slot]
+        per_source[source] = {"slot": slot, "RMI": source_rmi.tolist(), "RSB": source_rsb.tolist()}
+        if placement_info["legacy_slot_export_available"]:
+            rmi[slot], rsb[slot] = source_rmi, source_rsb
         q = {"static_sample_count": len(si), "walk_sample_count": len(wi),
              "horizontal_displacement_m": distance, "displacement_I_m": d.tolist(),
              "uncorrected_position_I_m": p.tolist(), "terminal_velocity_I_m_s": v.tolist(),
@@ -249,7 +257,7 @@ def calibration(motions, slots, static, walk, config, post=None, paired=None):
                 dd, _, _ = integrate(m, shifted)
                 if np.linalg.norm(dd) < limit:
                     raise CalibrationError(f"{source}: displacement unstable under 100ms window shift")
-                sensitivity.append(angle_deg(rotation_from_forward(dd), rmi[slot]))
+                sensitivity.append(angle_deg(rotation_from_forward(dd), source_rmi))
             q["heading_sensitivity_100ms_deg"] = max(sensitivity)
             if max(sensitivity) > config.max_heading_sensitivity_deg:
                 raise CalibrationError(f"{source}: heading unstable under 100ms window shift", q)
@@ -270,7 +278,8 @@ def calibration(motions, slots, static, walk, config, post=None, paired=None):
                     "monotonic" if np.all(np.isfinite(m.monotonic_s)) else "unix_relative")}
     if post:
         windows.append({"kind": "post_static", "start_timestamp_s": post[0], "end_timestamp_s": post[1]})
-    result = {"schema_version": 1, "offline_algorithm_version": 1, "method": "walking_6dof", "source_slots": slots,
+    result = {"schema_version": 2, "offline_algorithm_version": 1, "method": "walking_6dof", "source_slots": slots,
+              "placement": placement_info, "source_calibration": per_source,
               "session_ids": {s: m.session_id for s, m in motions.items()},
               "clock_offset_s": {s: m.offset_s for s, m in motions.items()},
               "clock_offsets_frozen": True,
@@ -280,7 +289,8 @@ def calibration(motions, slots, static, walk, config, post=None, paired=None):
                                         "inertial_up_used": UP.tolist(), "version": "sensor.py_compatibility",
                                         "acceleration": "CoreMotion userAcceleration, gravity removed, m/s^2"},
               "windows": windows, "apply_from_timestamp_s": post[1] if post else walk[1],
-              "RMI": rmi.tolist(), "RSB": rsb.tolist()}
+              "RMI": rmi.tolist() if placement_info["legacy_slot_export_available"] else None,
+              "RSB": rsb.tolist() if placement_info["legacy_slot_export_available"] else None}
     return result, quality
 
 
@@ -304,7 +314,7 @@ def detection_signals(motions, config):
     return origin, grid, all_static, signals
 
 
-def auto_calibrate(motions, slots, config):
+def auto_calibrate(motions, slots, config, placement_info=None):
     origin, grid, mask, _ = detection_signals(motions, config)
     edges = np.diff(np.r_[False, mask, False].astype(int))
     runs = [(float(grid[a]), float(grid[b - 1])) for a, b in zip(np.where(edges == 1)[0], np.where(edges == -1)[0])
@@ -318,7 +328,7 @@ def auto_calibrate(motions, slots, config):
         post = (after[0], min(after[1], after[0] + 2.0))
         walk = (before[1] - 0.2, after[0] + 0.2)
         try:
-            cal, quality = calibration(motions, slots, static, walk, config, post)
+            cal, quality = calibration(motions, slots, static, walk, config, post, placement_info=placement_info)
             accepted.append((cal, quality))
         except CalibrationError as exc:
             rejected.append({"walk_relative_s": [x - origin for x in walk], "reason": str(exc), "details": exc.details})
@@ -365,26 +375,33 @@ def replay_reference(motions, slots, reference, config):
         windows.append(bounds)
         paired.append(ix)
         info.append(detail)
-    cal, quality = calibration(motions, slots, *windows, config, paired=paired)
+    cal, quality = calibration(motions, slots, *windows, config, paired=paired, placement_info=reference.get("placement"))
     cal["offline_mode"] = "reference_replay_not_auto"
     return cal, quality, {"replay_windows": info, "note": "Uses saved final clock offsets. Historical per-window offsets/received sample IDs were not saved; exact replay is not guaranteed."}
 
 
 def compare(cal, reference):
     result = {}
+    warnings = []
     for s, slot in cal["source_slots"].items():
         if s not in reference["source_slots"] or cal["session_ids"][s] != reference["session_ids"].get(s):
             raise CalibrationError(f"Reference does not belong to the same {s} session")
         ref_slot = reference["source_slots"][s]
         if slot != ref_slot:
             raise CalibrationError(f"Reference body slot differs for {s}")
-        for key in ("RMI", "RSB"):
-            r = np.array(reference[key][ref_slot])
+        name = cal.get("placement", {}).get("source_placements", {}).get(s, "unspecified")
+        ref_name = reference.get("placement", {}).get("source_placements", {}).get(s, "unspecified")
+        if name != "unspecified" and ref_name != "unspecified" and name != ref_name:
+            raise CalibrationError(f"Reference physical placement differs for {s}")
+        if "unspecified" in (name, ref_name):
+            warnings.append(f"{s}: physical placement cannot be verified against the reference")
+        actual, expected = source_rotations(cal, s), source_rotations(reference, s)
+        for key, r in zip(("RMI", "RSB"), expected):
             if r.shape != (3, 3) or not np.all(np.isfinite(r)) or np.linalg.norm(r @ r.T - np.eye(3)) > .01 or np.linalg.det(r) < .99:
                 raise CalibrationError(f"Invalid reference {key} rotation for {s}")
-        result[s] = {key + "_angle_deg": angle_deg(np.array(cal[key][slot]), np.array(reference[key][ref_slot])) for key in ("RMI", "RSB")}
+        result[s] = {key + "_angle_deg": angle_deg(a, b) for key, a, b in zip(("RMI", "RSB"), actual, expected)}
     return {"metric": "SO(3) geodesic angular difference in degrees; reference is not ground truth",
-            "sources": result}
+            "sources": result, "warnings": warnings}
 
 
 def apply_calibration(motions, cal, output, max_gap, clocks=None):
@@ -393,7 +410,8 @@ def apply_calibration(motions, cal, output, max_gap, clocks=None):
         slot = cal["source_slots"][s]
         corrected = m.time if clocks is None else clocks[s].corrected_ns(m.unix_ns) / 1e9
         ix = np.flatnonzero(corrected >= cal["apply_from_timestamp_s"])
-        rmi, rsb = np.array(cal["RMI"][slot]), np.array(cal["RSB"][slot])
+        rmi, rsb = source_rotations(cal, s)
+        placement = cal.get("placement") or describe_placements(cal["source_slots"])
         aI = np.einsum("nij,nj->ni", m.RIS[ix], m.aS[ix])
         gap = np.r_[False, np.diff(m.integration_time[ix]) > max_gap] if len(ix) else np.array([], dtype=bool)
         path = Path(output) / f"{s}-calibrated.npz"
@@ -401,7 +419,9 @@ def apply_calibration(motions, cal, output, max_gap, clocks=None):
                             timestamp_corrected_s=corrected[ix], sequence_number=m.sequence[ix],
                             acc_M_m_s2=(rmi @ aI.T).T, ori_MB=rmi @ m.RIS[ix] @ rsb,
                             gyro_S_rad_s=m.gyroS[ix], gyro_B_rad_s=(rsb.T @ m.gyroS[ix].T).T,
-                            gap_before=gap, source=np.array(s), session_id=np.array(m.session_id), slot=np.array(slot))
+                            gap_before=gap, source=np.array(s), session_id=np.array(m.session_id), slot=np.array(slot),
+                            placement=np.array(placement["source_placements"][s]),
+                            target_frame=np.array(placement["source_target_frames"][s]), RMI=rmi, RSB=rsb)
         artifacts[s] = {"file": path.name, "sample_count": len(ix), "gap_count": int(np.sum(gap))}
     return artifacts
 

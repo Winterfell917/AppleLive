@@ -15,6 +15,7 @@ from scipy.signal import butter, sosfiltfilt
 from scipy.spatial.transform import Rotation, Slerp
 
 from .offline import CalibrationError, Motion, canonical
+from .placements import describe_placements, placement_arrays, source_rotations
 
 
 # These independent raw channels retain the app's original Apple axes/units.
@@ -331,8 +332,13 @@ def grid_motions(arrays, original):
 
 def calibrated_arrays(arrays, cal):
     out = dict(arrays)
-    rmi = np.array([cal["RMI"][slot] for slot in arrays["source_slots"]])
-    rsb = np.array([cal["RSB"][slot] for slot in arrays["source_slots"]])
+    sources = arrays["source_names"].tolist()
+    if list(arrays["source_slots"]) != [cal["source_slots"][s] for s in sources]:
+        raise CalibrationError("Aligned source slots differ from the calibration")
+    rotations = [source_rotations(cal, s) for s in sources]
+    rmi, rsb = np.stack([r[0] for r in rotations]), np.stack([r[1] for r in rotations])
+    placement = cal.get("placement") or describe_placements(cal["source_slots"])
+    out.update(placement_arrays(placement, sources))
     ai = np.einsum("nsij,nsj->nsi", arrays["RIS"], arrays["user_acc_S_m_s2"])
     out.update(RMI=rmi, RSB=rsb, acc_M_m_s2=np.einsum("sij,nsj->nsi", rmi, ai),
                ori_MB=rmi[None] @ arrays["RIS"] @ rsb[None],
@@ -342,8 +348,11 @@ def calibrated_arrays(arrays, cal):
     return out
 
 
-def save_native_archive(path, motions, streams):
+def save_native_archive(path, motions, streams, placement_info=None):
     out = {"session_id": np.array(next(iter(motions.values())).session_id), "source_names": np.array(list(motions))}
+    if placement_info:
+        out.update(placement_arrays(placement_info, list(motions)))
+        out["source_slots"] = np.array([placement_info["source_slots"][s] for s in motions])
     for s, m in motions.items():
         prefix = s + "__motion__"
         for name, value in {"timestamp_unix_ns": m.unix_ns, "timestamp_monotonic_s": m.monotonic_s,
