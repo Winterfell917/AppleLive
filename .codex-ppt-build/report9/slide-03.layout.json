@@ -1,0 +1,698 @@
+{
+  "schema": "openai.presentation.layout/v5",
+  "unit": "px",
+  "slide": {
+    "id": "sl/ofy9wn61",
+    "index": 2,
+    "layout": {
+      "id": "ly/p83mt83u",
+      "name": "标题和内容"
+    },
+    "masterLayoutId": "ly/atofqts7",
+    "backgroundColor": "rgba(255,255,255,1)",
+    "position": {
+      "left": 0,
+      "top": 0,
+      "width": 1280,
+      "height": 720
+    }
+  },
+  "inheritedLayers": [
+    {
+      "scope": "layout",
+      "id": "ly/p83mt83u",
+      "name": "标题和内容",
+      "type": "obj",
+      "parentLayoutId": "ly/atofqts7",
+      "elements": [
+        {
+          "order": 1,
+          "kind": "textbox",
+          "scope": "layout",
+          "id": "sh/vmhw7i1c",
+          "editable": false,
+          "name": "标题 1",
+          "position": {
+            "left": 0,
+            "top": 0,
+            "width": 0,
+            "height": 0
+          },
+          "text": "单击此处编辑母版标题样式",
+          "paragraphs": [
+            {
+              "index": 1,
+              "text": "单击此处编辑母版标题样式",
+              "runs": [
+                {
+                  "index": 1,
+                  "text": "单击此处编辑母版标题样式"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "order": 2,
+          "kind": "textbox",
+          "scope": "layout",
+          "id": "sh/ul8vyd0r",
+          "editable": false,
+          "name": "内容占位符 2",
+          "position": {
+            "left": 0,
+            "top": 0,
+            "width": 0,
+            "height": 0
+          },
+          "text": "单击此处编辑母版文本样式\n二级\n三级\n四级\n五级",
+          "paragraphs": [
+            {
+              "index": 1,
+              "text": "单击此处编辑母版文本样式",
+              "runs": [
+                {
+                  "index": 1,
+                  "text": "单击此处编辑母版文本样式"
+                }
+              ]
+            },
+            {
+              "index": 2,
+              "text": "二级",
+              "runs": [
+                {
+                  "index": 1,
+                  "text": "二级"
+                }
+              ]
+            },
+            {
+              "index": 3,
+              "text": "三级",
+              "runs": [
+                {
+                  "index": 1,
+                  "text": "三级"
+                }
+              ]
+            },
+            {
+              "index": 4,
+              "text": "四级",
+              "runs": [
+                {
+                  "index": 1,
+                  "text": "四级"
+                }
+              ]
+            },
+            {
+              "index": 5,
+              "text": "五级",
+              "runs": [
+                {
+                  "index": 1,
+                  "text": "五级"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "order": 3,
+          "kind": "textbox",
+          "scope": "layout",
+          "id": "sh/9kfe5sj6",
+          "editable": false,
+          "name": "日期占位符 3",
+          "position": {
+            "left": 0,
+            "top": 0,
+            "width": 0,
+            "height": 0
+          },
+          "text": "2026/9/28",
+          "paragraphs": [
+            {
+              "index": 1,
+              "text": "2026/9/28",
+              "runs": [
+                {
+                  "index": 1,
+                  "text": "2026/9/28"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "order": 4,
+          "kind": "shape",
+          "scope": "layout",
+          "id": "sh/8j6dwnil",
+          "editable": false,
+          "name": "页脚占位符 4",
+          "position": {
+            "left": 0,
+            "top": 0,
+            "width": 0,
+            "height": 0
+          }
+        },
+        {
+          "order": 5,
+          "kind": "textbox",
+          "scope": "layout",
+          "id": "sh/7ixw3i1g",
+          "editable": false,
+          "name": "灯片编号占位符 5",
+          "position": {
+            "left": 0,
+            "top": 0,
+            "width": 0,
+            "height": 0
+          },
+          "text": "3",
+          "paragraphs": [
+            {
+              "index": 1,
+              "text": "3",
+              "runs": [
+                {
+                  "index": 1,
+                  "text": "3"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "scope": "master",
+      "id": "ly/atofqts7",
+      "type": "master",
+      "elements": [
+        {
+          "order": 1,
+          "kind": "textbox",
+          "scope": "master",
+          "id": "sh/4va94z21",
+          "editable": false,
+          "name": "标题占位符 1",
+          "position": {
+            "left": 88,
+            "top": 38.33,
+            "width": 1104,
+            "height": 139.17
+          },
+          "geometry": "rect",
+          "text": "单击此处编辑母版标题样式",
+          "style": {
+            "anchor": 2,
+            "vertical": 1,
+            "verticalAlignment": "middle",
+            "autoFit": "shrinkText",
+            "insets": {
+              "top": 4.8,
+              "right": 9.6,
+              "bottom": 4.8,
+              "left": 9.6
+            }
+          },
+          "paragraphs": [
+            {
+              "index": 1,
+              "text": "单击此处编辑母版标题样式",
+              "runs": [
+                {
+                  "index": 1,
+                  "text": "单击此处编辑母版标题样式",
+                  "anchor": 2,
+                  "vertical": 1,
+                  "verticalAlignment": "middle",
+                  "autoFit": "shrinkText",
+                  "insets": {
+                    "top": 4.8,
+                    "right": 9.6,
+                    "bottom": 4.8,
+                    "left": 9.6
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "order": 2,
+          "kind": "textbox",
+          "scope": "master",
+          "id": "sh/pwjax436",
+          "editable": false,
+          "name": "文本占位符 2",
+          "position": {
+            "left": 88,
+            "top": 191.67,
+            "width": 1104,
+            "height": 456.83
+          },
+          "geometry": "rect",
+          "text": "单击此处编辑母版文本样式\n二级\n三级\n四级\n五级",
+          "style": {
+            "vertical": 1,
+            "autoFit": "shrinkText",
+            "insets": {
+              "top": 4.8,
+              "right": 9.6,
+              "bottom": 4.8,
+              "left": 9.6
+            }
+          },
+          "paragraphs": [
+            {
+              "index": 1,
+              "text": "单击此处编辑母版文本样式",
+              "runs": [
+                {
+                  "index": 1,
+                  "text": "单击此处编辑母版文本样式",
+                  "vertical": 1,
+                  "autoFit": "shrinkText",
+                  "insets": {
+                    "top": 4.8,
+                    "right": 9.6,
+                    "bottom": 4.8,
+                    "left": 9.6
+                  }
+                }
+              ]
+            },
+            {
+              "index": 2,
+              "text": "二级",
+              "runs": [
+                {
+                  "index": 1,
+                  "text": "二级",
+                  "vertical": 1,
+                  "autoFit": "shrinkText",
+                  "insets": {
+                    "top": 4.8,
+                    "right": 9.6,
+                    "bottom": 4.8,
+                    "left": 9.6
+                  }
+                }
+              ]
+            },
+            {
+              "index": 3,
+              "text": "三级",
+              "runs": [
+                {
+                  "index": 1,
+                  "text": "三级",
+                  "vertical": 1,
+                  "autoFit": "shrinkText",
+                  "insets": {
+                    "top": 4.8,
+                    "right": 9.6,
+                    "bottom": 4.8,
+                    "left": 9.6
+                  }
+                }
+              ]
+            },
+            {
+              "index": 4,
+              "text": "四级",
+              "runs": [
+                {
+                  "index": 1,
+                  "text": "四级",
+                  "vertical": 1,
+                  "autoFit": "shrinkText",
+                  "insets": {
+                    "top": 4.8,
+                    "right": 9.6,
+                    "bottom": 4.8,
+                    "left": 9.6
+                  }
+                }
+              ]
+            },
+            {
+              "index": 5,
+              "text": "五级",
+              "runs": [
+                {
+                  "index": 1,
+                  "text": "五级",
+                  "vertical": 1,
+                  "autoFit": "shrinkText",
+                  "insets": {
+                    "top": 4.8,
+                    "right": 9.6,
+                    "bottom": 4.8,
+                    "left": 9.6
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "order": 3,
+          "kind": "textbox",
+          "scope": "master",
+          "id": "sh/qxsr69kr",
+          "editable": false,
+          "name": "日期占位符 3",
+          "position": {
+            "left": 88,
+            "top": 667.33,
+            "width": 288,
+            "height": 38.33
+          },
+          "geometry": "rect",
+          "text": "2026/9/28",
+          "style": {
+            "anchor": 2,
+            "vertical": 1,
+            "verticalAlignment": "middle",
+            "insets": {
+              "top": 4.8,
+              "right": 9.6,
+              "bottom": 4.8,
+              "left": 9.6
+            }
+          },
+          "paragraphs": [
+            {
+              "index": 1,
+              "text": "2026/9/28",
+              "runs": [
+                {
+                  "index": 1,
+                  "text": "2026/9/28",
+                  "anchor": 2,
+                  "vertical": 1,
+                  "verticalAlignment": "middle",
+                  "insets": {
+                    "top": 4.8,
+                    "right": 9.6,
+                    "bottom": 4.8,
+                    "left": 9.6
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "order": 4,
+          "kind": "shape",
+          "scope": "master",
+          "id": "sh/ry1szulc",
+          "editable": false,
+          "name": "页脚占位符 4",
+          "position": {
+            "left": 424,
+            "top": 667.33,
+            "width": 432,
+            "height": 38.33
+          },
+          "geometry": "rect",
+          "style": {
+            "anchor": 2,
+            "vertical": 1,
+            "verticalAlignment": "middle",
+            "insets": {
+              "top": 4.8,
+              "right": 9.6,
+              "bottom": 4.8,
+              "left": 9.6
+            }
+          }
+        },
+        {
+          "order": 5,
+          "kind": "textbox",
+          "scope": "master",
+          "id": "sh/czu98z2x",
+          "editable": false,
+          "name": "灯片编号占位符 5",
+          "position": {
+            "left": 904,
+            "top": 667.33,
+            "width": 288,
+            "height": 38.33
+          },
+          "geometry": "rect",
+          "text": "3",
+          "style": {
+            "anchor": 2,
+            "vertical": 1,
+            "verticalAlignment": "middle",
+            "insets": {
+              "top": 4.8,
+              "right": 9.6,
+              "bottom": 4.8,
+              "left": 9.6
+            }
+          },
+          "paragraphs": [
+            {
+              "index": 1,
+              "text": "3",
+              "runs": [
+                {
+                  "index": 1,
+                  "text": "3",
+                  "anchor": 2,
+                  "vertical": 1,
+                  "verticalAlignment": "middle",
+                  "insets": {
+                    "top": 4.8,
+                    "right": 9.6,
+                    "bottom": 4.8,
+                    "left": 9.6
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "elements": [
+    {
+      "order": 1,
+      "kind": "textbox",
+      "scope": "slide",
+      "id": "sh/cza94vmx",
+      "editable": true,
+      "name": "TextBox 1",
+      "position": {
+        "left": 52.8,
+        "top": 26.88,
+        "width": 1171.2,
+        "height": 59.52
+      },
+      "geometry": "rect",
+      "text": "二、上周工作和结论",
+      "style": {
+        "fontSize": 53.33,
+        "typeface": "黑体",
+        "color": "#222222",
+        "bold": false,
+        "italic": false,
+        "alignment": "left",
+        "wrap": "square",
+        "insets": {
+          "top": 4.8,
+          "right": 9.6,
+          "bottom": 4.8,
+          "left": 9.6
+        }
+      },
+      "paragraphs": [
+        {
+          "index": 1,
+          "text": "二、上周工作和结论",
+          "style": {
+            "alignment": "left"
+          },
+          "runs": [
+            {
+              "index": 1,
+              "text": "二、上周工作和结论",
+              "fontSize": 53.33,
+              "typeface": "黑体",
+              "color": "#222222",
+              "bold": false,
+              "alignment": "left",
+              "wrap": "square"
+            }
+          ],
+          "marginLeft": 0
+        }
+      ]
+    },
+    {
+      "order": 2,
+      "kind": "textbox",
+      "scope": "slide",
+      "id": "sh/d0jax03i",
+      "editable": true,
+      "name": "TextBox 2",
+      "position": {
+        "left": 57.6,
+        "top": 110.4,
+        "width": 1161.6,
+        "height": 537.6
+      },
+      "geometry": "rect",
+      "text": "学长建议：合成集到真机的域差异过大，应先采一个小规模真机数据集训练位置分类网络。\n- 上周重点：确定自采数据的规模、动作种类、佩戴组合、标签和文件格式。\n- 已完成：写好训练数据采集脚本，固化标定、录制、传输、对齐和质量检查协议。\n- 已调整：只用 iPhone 标定 R_MI，Watch 不单独标定，直接共享手机的 R_MI。\n- 当前阻塞：iPhone 与 Watch 采集软件仍需学长更新，未按原计划采完全部数据。\n- 结论：采集方案和代码已基本就绪，下一步取决于采集 App 更新和真机数据落地。",
+      "style": {
+        "fontSize": 29.33,
+        "typeface": "微软雅黑",
+        "color": "#222222",
+        "bold": true,
+        "italic": false,
+        "alignment": "left",
+        "wrap": "square",
+        "insets": {
+          "top": 4.8,
+          "right": 9.6,
+          "bottom": 4.8,
+          "left": 9.6
+        }
+      },
+      "paragraphs": [
+        {
+          "index": 1,
+          "text": "学长建议：合成集到真机的域差异过大，应先采一个小规模真机数据集训练位置分类网络。",
+          "style": {
+            "alignment": "left"
+          },
+          "runs": [
+            {
+              "index": 1,
+              "text": "学长建议：合成集到真机的域差异过大，应先采一个小规模真机数据集训练位置分类网络。",
+              "fontSize": 29.33,
+              "typeface": "微软雅黑",
+              "color": "#222222",
+              "bold": true,
+              "alignment": "left",
+              "wrap": "square"
+            }
+          ],
+          "marginLeft": 0
+        },
+        {
+          "index": 2,
+          "text": "- 上周重点：确定自采数据的规模、动作种类、佩戴组合、标签和文件格式。",
+          "style": {
+            "alignment": "left"
+          },
+          "runs": [
+            {
+              "index": 1,
+              "text": "- 上周重点：确定自采数据的规模、动作种类、佩戴组合、标签和文件格式。",
+              "fontSize": 29.33,
+              "typeface": "微软雅黑",
+              "color": "#222222",
+              "bold": true,
+              "alignment": "left",
+              "wrap": "square"
+            }
+          ],
+          "marginLeft": 0
+        },
+        {
+          "index": 3,
+          "text": "- 已完成：写好训练数据采集脚本，固化标定、录制、传输、对齐和质量检查协议。",
+          "style": {
+            "alignment": "left"
+          },
+          "runs": [
+            {
+              "index": 1,
+              "text": "- 已完成：写好训练数据采集脚本，固化标定、录制、传输、对齐和质量检查协议。",
+              "fontSize": 29.33,
+              "typeface": "微软雅黑",
+              "color": "#222222",
+              "bold": true,
+              "alignment": "left",
+              "wrap": "square"
+            }
+          ],
+          "marginLeft": 0
+        },
+        {
+          "index": 4,
+          "text": "- 已调整：只用 iPhone 标定 R_MI，Watch 不单独标定，直接共享手机的 R_MI。",
+          "style": {
+            "alignment": "left"
+          },
+          "runs": [
+            {
+              "index": 1,
+              "text": "- 已调整：只用 iPhone 标定 R_MI，Watch 不单独标定，直接共享手机的 R_MI。",
+              "fontSize": 29.33,
+              "typeface": "微软雅黑",
+              "color": "#222222",
+              "bold": true,
+              "alignment": "left",
+              "wrap": "square"
+            }
+          ],
+          "marginLeft": 0
+        },
+        {
+          "index": 5,
+          "text": "- 当前阻塞：iPhone 与 Watch 采集软件仍需学长更新，未按原计划采完全部数据。",
+          "style": {
+            "alignment": "left"
+          },
+          "runs": [
+            {
+              "index": 1,
+              "text": "- 当前阻塞：iPhone 与 Watch 采集软件仍需学长更新，未按原计划采完全部数据。",
+              "fontSize": 29.33,
+              "typeface": "微软雅黑",
+              "color": "#222222",
+              "bold": true,
+              "alignment": "left",
+              "wrap": "square"
+            }
+          ],
+          "marginLeft": 0
+        },
+        {
+          "index": 6,
+          "text": "- 结论：采集方案和代码已基本就绪，下一步取决于采集 App 更新和真机数据落地。",
+          "style": {
+            "alignment": "left"
+          },
+          "runs": [
+            {
+              "index": 1,
+              "text": "- 结论：采集方案和代码已基本就绪，下一步取决于采集 App 更新和真机数据落地。",
+              "fontSize": 29.33,
+              "typeface": "微软雅黑",
+              "color": "#222222",
+              "bold": true,
+              "alignment": "left",
+              "wrap": "square"
+            }
+          ],
+          "marginLeft": 0
+        }
+      ]
+    }
+  ]
+}
