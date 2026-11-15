@@ -193,7 +193,7 @@ def main() -> None:
         print("所有动作录完后，把手机数据一次复制到测试原始文件目录，再运行 --finalize-batch。")
     else:
         print(f"逐条导入模式：每条结束后等待文件并立即整理：{args.inbox.resolve()}")
-    print("已有 capture.json 或 labels.pt 的条目会自动跳过，可以中断后继续。")
+    print("已有 labels.pt 或待导入清单的条目会自动跳过；标定失败条目会要求重录。")
 
     session_map_path = train.write_session_map(root)
     previous_stage = None

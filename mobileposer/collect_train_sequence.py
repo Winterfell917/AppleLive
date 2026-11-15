@@ -486,6 +486,10 @@ def record_offline_take(
 ) -> str:
     """Guide local recording with live iPhone-only calibration validation."""
     directory = directory or sequence_directory(root, take)
+    # The offline path writes capture.json before any later finalization step.
+    # A freshly planned action/wear/orientation directory therefore needs to
+    # exist here, rather than relying on save_labels() (which runs much later).
+    directory.mkdir(parents=True, exist_ok=True)
     capture_path = directory / CAPTURE_FILENAME
     failed_attempts = []
     if (directory / LABELS_FILENAME).is_file():
@@ -493,17 +497,20 @@ def record_offline_take(
         return "skipped"
     if capture_path.is_file():
         existing = json.loads(capture_path.read_text(encoding="utf-8"))
-        if existing.get("status") == "calibration_failed":
+        existing_status = existing.get("status")
+        if existing_status in {"calibration_failed", "batch_finalize_failed"}:
             failed_attempts = list(existing.get("failed_attempts", []))
             failed_attempts.append(
                 {
                     "attempt_id": existing.get("attempt_id"),
+                    "status": existing_status,
                     "windows": existing.get("windows"),
                     "raw_files": existing.get("raw_files"),
-                    "calibration_failure": existing.get("calibration_failure"),
+                    "calibration_failure": existing.get("calibration_failure")
+                    or existing.get("batch_finalize_failure"),
                 }
             )
-            print(f"[{index}/{total}] 上一次标定失败，必须重新标定并重录本条。")
+            print(f"[{index}/{total}] 上一次整理的标定失败，必须重新标定并重录本条。")
         else:
             if args.defer_import:
                 print(f"[{index}/{total}] 已登记待批量整理，跳过：{directory}")
@@ -3279,7 +3286,7 @@ def main() -> None:
             print("所有动作录完后，把手机数据一次复制到电脑，再运行 --finalize-batch。")
         else:
             print(f"逐条导入模式：每条结束后等待文件并立即整理：{args.inbox.resolve()}")
-        print("已有 capture.json 或 labels.pt 的条目会自动跳过，可以中断后继续。")
+        print("已有 labels.pt 或待导入清单的条目会自动跳过；标定失败条目会要求重录。")
         session_map_path = write_session_map(root)
         previous_wear = None
         for index, take in enumerate(plan, start=1):
