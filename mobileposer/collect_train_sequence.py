@@ -2,22 +2,20 @@
 
 Ten actions, four wears (watch left/right wrist × phone left/right pocket),
 three groups per wear, and two pocket facings per group: 10 × 4 × 3 × 2 = 240.
-Each take records timed N-pose, forward-walk, and action windows.  The iPhone and
-Apple Watch write their own files during capture; no live Watch stream is
-required.  The iPhone additionally streams device_motion over UDP only while
-N-pose/forward-walk calibration is checked, before the action starts.  Every
-capture records the phone sessionID, so all files may be copied by USB after a
-collection run.  ``--finalize-batch`` then matches iPhone/Watch NDJSON files to
-formal sequence names by sessionID, estimates one shared R_MI from the iPhone,
-aligns both devices at 30 FPS, and writes model-frame acceleration/orientation
-plus slot truth.
+Each take records timed initial-static, forward-walk, final-static, and action
+windows. The iPhone and Apple Watch write their own files throughout; no UDP
+stream is used during collection. After USB export, ``--finalize-batch`` pairs
+the device-local sessions, calculates ``R_MI`` and ``R_SB`` independently for
+each device from the complete recordings, aligns both devices at 30 FPS, and
+writes model-frame acceleration/orientation plus slot truth.
 
 Pocket facings in each group, phone head down:
     screen_in   屏幕朝内，头朝下
     screen_out  屏幕朝外，头朝下
 
-The saved acceleration and orientation are in model coordinates.  The Watch is
-not calibrated independently; it uses the R_MI estimated from the iPhone.
+The saved acceleration and orientation are in model coordinates. Both devices
+are calibrated independently from the prescribed walking-calibration protocol;
+neither device reuses the other's ``R_MI``.
 The watch bone is slot 0 (lw) or 1 (rw). The phone bone is slot 2 (lp) or 3 (rp).
 """
 
@@ -46,7 +44,7 @@ from collect_eval_sequence import (
     save_uwb_plot,
     wait_for_streams,
 )
-from sensor_apple.sensor import APPLE_I_UP_RH, GRAVITY, beep
+from sensor_apple.sensor import APPLE_I_UP_RH, GRAVITY, NPOSE_RMB, beep
 
 
 ACTIONS = (
@@ -105,7 +103,8 @@ FACING_LABEL = {
 CAPTURE_FILENAME = "capture.json"
 LABELS_FILENAME = "labels.pt"
 LIVE_CALIBRATION_FILENAME = "live_iphone_calibration.ndjson"
-OFFLINE_CAPTURE_SCHEMA_VERSION = 2
+OFFLINE_CAPTURE_SCHEMA_VERSION = 3
+OFFLINE_CALIBRATION_PROTOCOL = "walking_static_step_static_v1"
 DEFAULT_INBOX_DIR = Path(__file__).resolve().parent / "data" / "device_inbox"
 DEFAULT_RAW_ROOT = Path(__file__).resolve().parent / "data" / "datasets" / "train"
 DEFAULT_LABEL_ROOT = Path(__file__).resolve().parent / "data" / "datasets" / "train_labels"
@@ -404,6 +403,7 @@ def capture_manifest(
     collection_start_unix_s: float,
     npose_window: dict,
     walk_window: dict,
+    post_static_window: dict,
     action_window: dict,
 ) -> dict:
     slots = placement(take)
@@ -434,17 +434,25 @@ def capture_manifest(
         "windows": {
             "npose": npose_window,
             "forward_walk": walk_window,
+            "post_static": post_static_window,
             "action": action_window,
         },
         "calibration_window_reference": {
             "clock": "PC Unix time in seconds",
             "applies_to_devices": list(DEVICES),
-            "phases": ["npose", "forward_walk"],
+            "phases": ["npose", "forward_walk", "post_static"],
             "selection_rule": (
-                "After USB import, select each device's device_motion whose "
-                "timestampUnixNs plus that device's recorded time offset falls "
-                "inside windows.npose or windows.forward_walk."
+                "These PC-clock windows are collection annotations only. After USB "
+                "import, the complete local iPhone and Watch recordings are used to "
+                "locate the prescribed static-walk-static calibration protocol and "
+                "compute each device's R_MI and R_SB independently."
             ),
+        },
+        "offline_calibration_protocol": {
+            "id": OFFLINE_CALIBRATION_PROTOCOL,
+            "instruction": "双手自然并拢静止（N-pose）—直线向前走一步并停稳—双手自然并拢静止（N-pose）",
+            "devices": list(DEVICES),
+            "calibration_result": "each device independently provides R_MI and R_SB from complete local files",
         },
         "raw_files": {"iphone": None, "apple_watch": None},
         "failed_attempts": [],
@@ -456,9 +464,9 @@ def capture_manifest(
             "quality": None,
         },
         "notes": (
-            "Apple Watch and iPhone recorded locally. The successful live iPhone "
-            "calibration samples are saved explicitly and matched by sessionID, "
-            "sequenceNumber, and timestampUnixNs during --finalize."
+            "Apple Watch and iPhone recorded locally without real-time UDP. "
+            "The three timed calibration phases are retained as audit annotations; "
+            "offline finalization calculates R_MI and R_SB independently per device."
         ),
     }
     if take.get("subject") is not None:
@@ -528,75 +536,29 @@ def record_offline_take(
         return "skipped"
 
     input(
-        "请在 iPhone 和 Apple Watch 上开始一段新的本地采集，并打开 iPhone 的 UDP "
-        f"实时传输到本机端口 {args.port}；确认后立即按回车。"
+        "请在 iPhone 和 Apple Watch 上开始同一段新的本地采集。不要打开 UDP 实时传输；"
+        "确认两台设备都在本地记录后立即按回车。"
     )
     collection_start_unix_s = time.time()
-    live_result = None
-    while live_result is None:
-        try:
-            with SensorReadReceiver(args.host, args.port) as receiver:
-                print(f"正在监听 iPhone 标定流 udp://{args.host}:{args.port}")
-                wait_for_iphone_stream(receiver)
-                print("已收到 iPhone device_motion；Apple Watch 无需实时传输。")
-                while live_result is None:
-                    live_result = calibrate_once(
-                        receiver,
-                        args.npose,
-                        args.walk,
-                        take,
-                        include_windows=True,
-                    )
-                    if live_result is not None:
-                        break
-                    answer = input(
-                        "iPhone 标定未通过。直接按回车重新标定，q 停止本条: "
-                    ).strip().lower()
-                    if answer == "q":
-                        print("请在 iPhone 和 Apple Watch 上停止当前本地采集。")
-                        return "quit"
-        except (OSError, RuntimeError, TimeoutError) as error:
-            print(f"iPhone 实时标定流不可用：{error}")
-            answer = input(
-                "检查手机 UDP 地址/端口和防火墙后按回车重新监听，q 停止本条: "
-            ).strip().lower()
-            if answer == "q":
-                print("请在 iPhone 和 Apple Watch 上停止当前本地采集。")
-                return "quit"
-
-    live_calibration, windows, live_samples = live_result
-    npose_window = windows["npose"]
-    walk_window = windows["forward_walk"]
-    calibration_session_ids = sorted(
-        {
-            str(sample.get("session_id", ""))
-            for phase_samples in live_samples.values()
-            for sample in phase_samples
-            if str(sample.get("session_id", ""))
-        }
+    experiment = take.get("experiment", {})
+    calibration_instruction = experiment.get("calibration_instruction")
+    if calibration_instruction:
+        print(calibration_instruction, flush=True)
+    print(
+        "离线标定：双手自然并拢、手表侧手臂保持固定。先静止；提示音后直线向前走一步并停稳；"
+        "第二次提示音后继续静止。R_MI 和 R_SB 将在导入完整手机/手表文件后分别计算。",
+        flush=True,
     )
-    if len(calibration_session_ids) != 1:
-        found = ", ".join(calibration_session_ids) or "无"
-        print(
-            "无法为本条建立唯一的手机文件对应关系："
-            f"在线标定中发现的 sessionID 为 {found}。"
-        )
-        print("请停止手机和手表的本次本地采集，并在两台设备上重新开始一个新会话。")
-        answer = input("准备好后按回车重新采集本条；输入 q 停止: ").strip().lower()
-        if answer == "q":
-            return "quit"
-        return record_offline_take(root, take, index, total, args, directory)
-    directory.mkdir(parents=True, exist_ok=True)
-    live_trace_path = directory / LIVE_CALIBRATION_FILENAME
-    save_live_calibration_samples(
-        live_trace_path,
-        live_samples["npose"],
-        live_samples["forward_walk"],
-    )
-    input(
-        "iPhone 标定成功。现在关闭手机的 UDP 实时传输（不要停止本地采集）；"
-        "确认关闭后按回车开始准备正式动作。"
-    )
+    input("站成 N-pose，面向标定方向，双手自然并拢并保持不动；按回车开始第一段静止。")
+    npose_window = timed_window("标定第一段静止", args.npose)
+    beep(880, 180)
+    input("现在直线向前走一步，停稳后保持原朝向；按回车开始记录前向走窗口。")
+    walk_window = timed_window("标定前向走", args.walk)
+    beep(660, 180)
+    input("站稳后双手自然并拢并保持不动；按回车开始第二段静止。")
+    post_static_window = timed_window("标定第二段静止", args.npose)
+    calibration_success_beep()
+    print("离线标定阶段已记录；结果将在导入完整本地文件时验证。", flush=True)
 
     cue = ACTION_CUE[take["action"]]
     post_calibration_instruction = take.get("experiment", {}).get(
@@ -619,33 +581,15 @@ def record_offline_take(
         collection_start_unix_s,
         npose_window,
         walk_window,
+        post_static_window,
         action_window,
     )
     manifest["failed_attempts"] = failed_attempts
-    phone_calibration = live_calibration[CALIBRATION_SOURCE]
-    manifest["live_iphone_calibration"] = {
-        "status": "passed",
-        "source": CALIBRATION_SOURCE,
-        "R_MI": phone_calibration["R_MI"].tolist(),
-        "horizontal_m": phone_calibration["horizontal_m"],
-        "vertical_m": phone_calibration["vertical_m"],
-        "npose_sample_count": phone_calibration["npose_sample_count"],
-        "walk_sample_count": phone_calibration["walk_sample_count"],
-        "npose_quality": phone_calibration["npose_quality"],
-        "forward_walk_quality": phone_calibration["forward_walk_quality"],
-        "watch_uses_iphone_r_mi": True,
-        "sample_selection_method": "explicit_event_identity",
-        "sample_artifact": LIVE_CALIBRATION_FILENAME,
-        "npose": live_sample_summary(live_samples["npose"]),
-        "forward_walk": live_sample_summary(live_samples["forward_walk"]),
-    }
-    manifest["expected_session_ids"] = calibration_session_ids
     manifest["file_matching"] = {
-        "strategy": "sessionID",
-        "expected_session_ids": calibration_session_ids,
+        "strategy": "chronological_common_session_order",
+        "expected_session_ids": [],
         "requires_same_session_for_iphone_and_watch": True,
     }
-    manifest["artifacts"]["live_calibration"] = LIVE_CALIBRATION_FILENAME
     write_json(capture_path, manifest)
 
     answer = input(
@@ -663,8 +607,7 @@ def record_offline_take(
         print("尚未接收设备文件；稍后可单条运行 --finalize，或正式序列运行 --finalize-batch。")
         return "quit"
     if args.defer_import:
-        session_text = ", ".join(calibration_session_ids) or "未记录"
-        print(f"已登记手机 sessionID：{session_text}")
+        print("本条已登记；未使用实时 UDP，因此 sessionID 将在导入原始文件时按时间顺序匹配。")
         print("本条无需现在连接 USB；全部动作录完后运行 --finalize-batch 统一整理。")
         return "saved"
     receive_status = receive_and_finalize(directory, root, args)
@@ -873,12 +816,9 @@ def model_space_sequences(
     calibration: dict[str, dict],
     grid: dict[str, torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return R_MS and aM using the iPhone R_MI for both devices."""
-    shared_rmi = calibration[CALIBRATION_SOURCE]["R_MI"]
-    for source in DEVICES:
-        if not torch.allclose(calibration[source]["R_MI"], shared_rmi, atol=1e-6, rtol=1e-6):
-            raise RuntimeError(f"{source} R_MI is not the shared iPhone R_MI")
-    orientation = torch.matmul(shared_rmi.view(1, 1, 3, 3), grid["RIS"])
+    """Return R_MS and aM using each device's independently estimated R_MI."""
+    r_mi = torch.stack([calibration[source]["R_MI"] for source in DEVICES])
+    orientation = torch.matmul(r_mi.view(1, len(DEVICES), 3, 3), grid["RIS"])
     acceleration = torch.matmul(orientation, grid["aS"].unsqueeze(-1)).squeeze(-1)
     return orientation.contiguous(), acceleration.contiguous()
 
@@ -939,6 +879,8 @@ def save_sequence(
         "orientation": orientation,
         "acceleration": acceleration,
         "motion_valid": grid["motion_valid"],
+        "R_MI": torch.stack([calibration[source]["R_MI"] for source in DEVICES]),
+        "R_SB": torch.stack([calibration[source]["R_SB"] for source in DEVICES]),
     }
     if take.get("subject") is not None:
         payload["subject"] = take["subject"]
@@ -966,8 +908,8 @@ def save_sequence(
         "record_start_unix_s": record_window[0],
         "record_end_unix_s": record_window[1],
         "convention": {
-            "orientation": "R_MS = shared iPhone R_MI @ RIS; maps sensor vectors to model coordinates",
-            "acceleration": "aM = shared iPhone R_MI @ RIS @ aS; model frame, m/s^2",
+            "orientation": "R_MS = device-specific R_MI @ RIS; maps sensor vectors to model coordinates",
+            "acceleration": "aM = device-specific R_MI @ RIS @ aS; model frame, m/s^2",
             "inertial_up": APPLE_I_UP_RH.tolist(),
             "R_MI": "rows are model X,Y,Z in I; v_M = R_MI @ v_I; up axis is APPLE_I_UP_RH",
             "uwb": "uwb_ranging.values.distance_m in meters; native samples plus 30 Hz hold of the latest sample",
@@ -978,6 +920,8 @@ def save_sequence(
             "orientation": "[frame, device, 3, 3] model-frame device orientation",
             "acceleration": "[frame, device, 3] model-frame linear acceleration in m/s^2",
             "motion_valid": "[frame, device] freshness mask for the saved sequences",
+            "R_MI": "[device, 3, 3] device-specific inertial-to-model calibration rotation",
+            "R_SB": "[device, 3, 3] device-specific sensor-to-bone mounting rotation from the initial static pose",
             "grid_time_s": "[frame] seconds from the start of the formal action window",
             "uwb_distance_m": "[frame, device] latest UWB distance in meters, devices order",
             "uwb_timestamp_s": "[frame, device] corrected Unix timestamp of the held UWB sample",
@@ -991,10 +935,11 @@ def save_sequence(
                 "slot": calibration[source]["slot"],
                 "model_slot": calibration[source]["model_slot"],
                 "calibration_source": calibration[source]["calibration_source"],
-                "calibrated_independently": source == CALIBRATION_SOURCE,
+                "calibrated_independently": calibration[source].get("calibrated_independently", False),
                 "horizontal_m": calibration[source].get("horizontal_m"),
                 "vertical_m": calibration[source].get("vertical_m"),
                 "R_MI": calibration[source]["R_MI"].tolist(),
+                "R_SB": calibration[source].get("R_SB").tolist() if calibration[source].get("R_SB") is not None else None,
                 "npose_sample_count": calibration[source].get("npose_sample_count"),
                 "walk_sample_count": calibration[source].get("walk_sample_count"),
                 "npose_quality": calibration[source].get("npose_quality"),
@@ -1096,6 +1041,7 @@ def merge_device_events(iphone_path: Path, watch_path: Path) -> tuple[list[dict]
 def extract_offline_streams(
     events: list[dict],
     time_offsets_s: dict[str, float],
+    expected_session_id: str | None = None,
 ) -> tuple[dict[str, list[dict]], list[dict], dict]:
     motion = {source: [] for source in DEVICES}
     uwb = []
@@ -1106,6 +1052,8 @@ def extract_offline_streams(
         if source not in DEVICES:
             continue
         session_id = str(event.get("sessionID", ""))
+        if expected_session_id is not None and session_id != expected_session_id:
+            continue
         if session_id:
             session_ids[source].add(session_id)
         sensor = event.get("sensor")
@@ -1711,91 +1659,56 @@ def calibrate_from_files(
             }
 
     offsets = time_offsets_s or {source: 0.0 for source in DEVICES}
-    watch_source = "apple_watch"
-    watch_npose_samples = samples_between(motion[watch_source], npose_start, npose_end)
-    watch_walk_samples = samples_between(motion[watch_source], walk_start, walk_end)
-    watch_windows = {
-        "selection_method": "pc_unix_window_from_capture_manifest",
-        "npose": calibration_window_summary(
-            watch_npose_samples, npose_start, npose_end, float(offsets[watch_source])
-        ),
-        "forward_walk": calibration_window_summary(
-            watch_walk_samples, walk_start, walk_end, float(offsets[watch_source])
-        ),
-    }
-    watch_coverage = (
-        "none"
-        if not motion[watch_source]
-        else f"{motion[watch_source][0]['timestamp_s']:.3f}..{motion[watch_source][-1]['timestamp_s']:.3f}"
-    )
-    try:
-        independent_watch = compute_device_calibration(
-            watch_npose_samples,
-            watch_walk_samples,
-            walk_end - walk_start,
-            watch_coverage,
-            "captured PC Unix calibration windows",
-            source=watch_source,
+    per_device = {CALIBRATION_SOURCE: selected}
+    for device_source in DEVICES:
+        if device_source == CALIBRATION_SOURCE:
+            continue
+        device_npose = samples_between(motion[device_source], npose_start, npose_end)
+        device_walk = samples_between(motion[device_source], walk_start, walk_end)
+        coverage = (
+            "none" if not motion[device_source] else
+            f"{motion[device_source][0]['timestamp_s']:.3f}..{motion[device_source][-1]['timestamp_s']:.3f}"
         )
-        watch_independent = {
-            "status": "passed",
-            "R_MI": independent_watch["R_MI"],
-            "horizontal_m": independent_watch["horizontal_m"],
-            "vertical_m": independent_watch["vertical_m"],
-            "npose_sample_count": independent_watch["npose_sample_count"],
-            "walk_sample_count": independent_watch["walk_sample_count"],
-            "npose_quality": independent_watch["npose_quality"],
-            "window_selection": watch_windows,
-        }
-    except CalibrationError as error:
-        # Wrist motion can make a Watch forward-walk calibration unreliable.
-        # It is a diagnostic and must not invalidate the accepted iPhone
-        # calibration or change the existing shared-R_MI output convention.
-        watch_independent = {
-            "status": "failed",
-            "reason": str(error),
-            "window_selection": watch_windows,
-        }
+        per_device[device_source] = compute_device_calibration(
+            device_npose, device_walk, walk_end - walk_start, coverage,
+            "captured offline calibration windows", source=device_source,
+        )
 
-    rotation_mi = selected["R_MI"]
     results = {}
     for device_source in DEVICES:
         info = slots[device_source]
+        device = per_device[device_source]
+        device_npose = samples_between(motion[device_source], npose_start, npose_end)
+        ris_npose = average_ris(device_npose)
+        if ris_npose is None:
+            raise CalibrationError(f"offline {device_source} calibration has no N-pose orientation")
+        r_sb = (device["R_MI"] @ ris_npose).transpose(0, 1) @ NPOSE_RMB[info["model_slot"]]
         item = {
             "source": device_source,
             "slot": info["slot"],
             "model_slot": info["model_slot"],
             "ok": True,
-            "R_MI": rotation_mi.clone(),
-            "calibration_source": CALIBRATION_SOURCE,
+            "R_MI": device["R_MI"].clone(),
+            "R_SB": r_sb,
+            "calibration_source": device_source,
+            "calibrated_independently": True,
+            "horizontal_m": device["horizontal_m"],
+            "vertical_m": device["vertical_m"],
+            "npose_sample_count": device["npose_sample_count"],
+            "walk_sample_count": device["walk_sample_count"],
+            "npose_quality": device["npose_quality"],
+            "sample_selection_method": comparison["selection_method"],
+            "window_selection": {
+                "npose": calibration_window_summary(device_npose, npose_start, npose_end, float(offsets[device_source])),
+                "forward_walk": calibration_window_summary(
+                    samples_between(motion[device_source], walk_start, walk_end), walk_start, walk_end,
+                    float(offsets[device_source]),
+                ),
+            },
         }
         if device_source == CALIBRATION_SOURCE:
-            item.update(
-                {
-                    "horizontal_m": selected["horizontal_m"],
-                    "vertical_m": selected["vertical_m"],
-                    "npose_sample_count": selected["npose_sample_count"],
-                    "walk_sample_count": selected["walk_sample_count"],
-                    "npose_quality": selected["npose_quality"],
-                    "forward_walk_quality": selected.get("forward_walk_quality") or capture.get(
-                        "live_iphone_calibration", {}
-                    ).get("forward_walk_quality"),
-                    "sample_selection_method": comparison["selection_method"],
-                    "r_mi_comparison": comparison,
-                }
-            )
-        elif device_source == watch_source:
-            item.update(
-                {
-                    "independent_R_MI_status": watch_independent["status"],
-                    "independent_R_MI": watch_independent.get("R_MI"),
-                    "independent_R_MI_details": {
-                        key: value
-                        for key, value in watch_independent.items()
-                        if key != "R_MI"
-                    },
-                }
-            )
+            item["forward_walk_quality"] = device.get("forward_walk_quality")
+            item["r_mi_comparison"] = comparison
         results[device_source] = item
     return results
 
@@ -1913,6 +1826,15 @@ def finalize_offline_capture(args: argparse.Namespace) -> None:
         raise SystemExit(f"{labels_path} 已存在；确认要重建时添加 --force-finalize")
 
     capture = json.loads(capture_path.read_text(encoding="utf-8"))
+    matched_session_ids = capture_session_ids(capture)
+    expected_session_id = args.session_id
+    if expected_session_id is None and len(matched_session_ids) == 1:
+        expected_session_id = matched_session_ids[0]
+    if expected_session_id is None:
+        raise SystemExit(
+            "此纯离线清单未记录 sessionID；请使用 --finalize-batch 自动按会话时间顺序匹配，"
+            "或在单条整理时显式提供 --session-id。"
+        )
     take = {
         "action": capture["action"],
         "watch": capture["watch"],
@@ -1949,7 +1871,9 @@ def finalize_offline_capture(args: argparse.Namespace) -> None:
     events, file_report = merge_device_events(
         args.iphone_file.resolve(), args.watch_file.resolve()
     )
-    motion, uwb, stream_report = extract_offline_streams(events, offsets)
+    motion, uwb, stream_report = extract_offline_streams(
+        events, offsets, expected_session_id=expected_session_id
+    )
     missing = [source for source in DEVICES if not motion[source]]
     if missing:
         raise RuntimeError(
@@ -1998,7 +1922,8 @@ def finalize_offline_capture(args: argparse.Namespace) -> None:
     live_forward_quality = capture.get("live_iphone_calibration", {}).get("forward_walk_quality")
     calibration_acceptance = {
         "source": CALIBRATION_SOURCE,
-        "watch_uses_iphone_r_mi": True,
+        "per_device_r_mi": True,
+        "per_device_r_sb": True,
         "max_npose_orientation_deviation_deg": MAX_NPOSE_ORIENTATION_DEG,
         "max_npose_acceleration_rms_m_s2": MAX_NPOSE_ACCEL_RMS_M_S2,
         "forward_window_trim_s": FORWARD_STABILITY_TRIM_S,
@@ -2034,13 +1959,15 @@ def finalize_offline_capture(args: argparse.Namespace) -> None:
         "calibration_acceptance": calibration_acceptance,
         "live_forward_walk_quality": live_forward_quality,
         "r_mi_comparison": calibration[CALIBRATION_SOURCE].get("r_mi_comparison"),
-        "watch_independent_calibration": {
-            "status": calibration["apple_watch"].get(
-                "independent_R_MI_status", "not_computed"
-            ),
-            "details": calibration["apple_watch"].get(
-                "independent_R_MI_details"
-            ),
+        "per_device_calibration": {
+            source: {
+                "R_MI": calibration[source]["R_MI"].tolist(),
+                "R_SB": calibration[source]["R_SB"].tolist(),
+                "horizontal_m": calibration[source]["horizontal_m"],
+                "npose_sample_count": calibration[source]["npose_sample_count"],
+                "walk_sample_count": calibration[source]["walk_sample_count"],
+            }
+            for source in DEVICES
         },
         "per_source": {
             source: stream_quality(
@@ -2075,17 +2002,18 @@ def finalize_offline_capture(args: argparse.Namespace) -> None:
     capture["time_offsets_s"] = offsets
     capture["time_offset_resolution"] = offset_resolution
     capture["session_ids"] = stream_report["session_ids"]
+    capture["expected_session_ids"] = [expected_session_id]
     capture["offline_calibration"] = {
-        "sample_selection_method": calibration[CALIBRATION_SOURCE].get(
-            "sample_selection_method"
-        ),
-        "r_mi_comparison": calibration[CALIBRATION_SOURCE].get("r_mi_comparison"),
-        "watch_independent_R_MI_status": calibration["apple_watch"].get(
-            "independent_R_MI_status", "not_computed"
-        ),
-        "watch_independent_calibration": calibration["apple_watch"].get(
-            "independent_R_MI_details"
-        ),
+        "protocol": OFFLINE_CALIBRATION_PROTOCOL,
+        "per_device": {
+            source: {
+                "R_MI": calibration[source]["R_MI"].tolist(),
+                "R_SB": calibration[source]["R_SB"].tolist(),
+                "sample_selection_method": calibration[source].get("sample_selection_method"),
+                "window_selection": calibration[source].get("window_selection"),
+            }
+            for source in DEVICES
+        },
     }
     capture.setdefault("artifacts", {}).update(
         {"raw": "raw.ndjson", "labels": LABELS_FILENAME, "quality": "quality.json"}
@@ -2105,21 +2033,13 @@ def finalize_offline_capture(args: argparse.Namespace) -> None:
             f"  {source}: 原始动作样本 {item['action_sample_count']}，"
             f"无效输出帧 {item['invalid_output_frame_count']}"
         )
-    comparison = calibration[CALIBRATION_SOURCE].get("r_mi_comparison", {})
-    print(f"  标定样本选择：{comparison.get('selection_method', 'unknown')}")
-    exact_angle = comparison.get("online_saved_vs_offline_exact_deg")
-    if exact_angle is not None:
-        print(f"  在线 R_MI 与离线精确复算差异：{exact_angle:.6f} deg")
-    watch_status = calibration["apple_watch"].get("independent_R_MI_status")
-    if watch_status == "passed":
-        print("  Apple Watch 离线独立 R_MI：已由标定时间窗计算（不改变共享 iPhone R_MI 输出）。")
-    elif watch_status == "failed":
-        print("  Apple Watch 离线独立 R_MI：未通过质量检查；详情已写入 meta.json。")
+    print("  离线标定：已分别计算 iPhone 和 Apple Watch 的 R_MI、R_SB。")
 
 
 def inspect_inbox_file(path: Path) -> dict:
     counts = {source: 0 for source in DEVICES}
     session_ids = {source: set() for source in DEVICES}
+    session_first_timestamp = {source: {} for source in DEVICES}
     invalid_lines = 0
     with path.open("r", encoding="utf-8") as source_file:
         for line in source_file:
@@ -2138,6 +2058,13 @@ def inspect_inbox_file(path: Path) -> dict:
                 session_id = str(event.get("sessionID", ""))
                 if session_id:
                     session_ids[source].add(session_id)
+                    try:
+                        timestamp_s = event_timestamp_s(event)
+                    except ValueError:
+                        continue
+                    previous = session_first_timestamp[source].get(session_id)
+                    if previous is None or timestamp_s < previous:
+                        session_first_timestamp[source][session_id] = timestamp_s
     lower_name = path.name.lower()
     if not any(counts.values()):
         if "watch" in lower_name:
@@ -2148,6 +2075,7 @@ def inspect_inbox_file(path: Path) -> dict:
         "path": path,
         "motion_counts": counts,
         "session_ids": {source: sorted(values) for source, values in session_ids.items()},
+        "session_first_timestamp_s": session_first_timestamp,
         "invalid_line_count": invalid_lines,
     }
 
@@ -2281,6 +2209,39 @@ def index_raw_session_files(raw_root: Path) -> tuple[dict[tuple[str, str], list[
     return index, reports
 
 
+def chronological_common_sessions(
+    index: dict[tuple[str, str], list[Path]], reports: list[dict]
+) -> list[str]:
+    """Return unambiguous iPhone/Watch sessions ordered by their first device timestamp."""
+    first_timestamp: dict[tuple[str, str], float] = {}
+    for report in reports:
+        for source in DEVICES:
+            for session_id, timestamp_s in report.get("session_first_timestamp_s", {}).get(source, {}).items():
+                key = (str(session_id), source)
+                if key not in first_timestamp or timestamp_s < first_timestamp[key]:
+                    first_timestamp[key] = float(timestamp_s)
+    session_ids = {session_id for session_id, _source in index}
+    candidates = []
+    for session_id in session_ids:
+        iphone = index.get((session_id, "iphone"), [])
+        watch = index.get((session_id, "apple_watch"), [])
+        if len(iphone) == 1 and len(watch) == 1:
+            first = max(
+                first_timestamp.get((session_id, "iphone"), float("inf")),
+                first_timestamp.get((session_id, "apple_watch"), float("inf")),
+            )
+            candidates.append((first, session_id))
+    return [session_id for _first, session_id in sorted(candidates)]
+
+
+def infer_single_common_session_id(iphone_path: Path, watch_path: Path) -> str | None:
+    """Infer a session only when the two per-take files make it unambiguous."""
+    iphone = inspect_inbox_file(iphone_path)["session_ids"]["iphone"]
+    watch = inspect_inbox_file(watch_path)["session_ids"]["apple_watch"]
+    common = sorted(set(iphone) & set(watch))
+    return common[0] if len(common) == 1 else None
+
+
 def finalize_batch(args: argparse.Namespace, root: Path) -> None:
     """Match every pending formal capture to exported files by sessionID."""
     if not root.is_dir():
@@ -2292,6 +2253,22 @@ def finalize_batch(args: argparse.Namespace, root: Path) -> None:
         relative = capture_path.parent.relative_to(root)
         if "_trial" not in relative.parts:
             capture_paths.append(capture_path)
+    capture_paths.sort(
+        key=lambda path: float(
+            json.loads(path.read_text(encoding="utf-8")).get("collection", {}).get(
+                "start_confirmed_unix_s", float("inf")
+            )
+        )
+    )
+    chronological_sessions = chronological_common_sessions(session_index, raw_reports)
+    claimed_sessions = {
+        session_id
+        for path in capture_paths
+        for session_id in capture_session_ids(json.loads(path.read_text(encoding="utf-8")))
+    }
+    chronological_sessions = [
+        session_id for session_id in chronological_sessions if session_id not in claimed_sessions
+    ]
 
     results = []
     for capture_path in capture_paths:
@@ -2303,6 +2280,20 @@ def finalize_batch(args: argparse.Namespace, root: Path) -> None:
             continue
         capture = json.loads(capture_path.read_text(encoding="utf-8"))
         session_ids = capture_session_ids(capture)
+        automatic_match = False
+        if not session_ids and capture.get("file_matching", {}).get("strategy") == "chronological_common_session_order":
+            if chronological_sessions:
+                session_ids = [chronological_sessions.pop(0)]
+                automatic_match = True
+            else:
+                results.append(
+                    {
+                        "sequence": relative,
+                        "status": "unmatched",
+                        "reason": "no unclaimed common iPhone/Watch session remains for chronological matching",
+                    }
+                )
+                continue
         if len(session_ids) != 1:
             results.append(
                 {
@@ -2338,7 +2329,7 @@ def finalize_batch(args: argparse.Namespace, root: Path) -> None:
             "apple_watch": str(watch_path.resolve()),
         }
         capture["batch_file_match"] = {
-            "matched_by": "sessionID",
+            "matched_by": "chronological_common_session_order" if automatic_match else "sessionID",
             "session_id": session_id,
             "raw_root": str(raw_root),
         }
@@ -2352,6 +2343,7 @@ def finalize_batch(args: argparse.Namespace, root: Path) -> None:
             iphone_time_offset=args.iphone_time_offset,
             watch_time_offset=args.watch_time_offset,
             fps=args.fps,
+            session_id=session_id,
         )
         try:
             finalize_offline_capture(finalize_args)
@@ -2592,6 +2584,9 @@ def receive_and_finalize(
             print(f"识别到 iPhone 文件：{iphone_path.name}")
             print(f"识别到 Watch 文件：{watch_path.name}")
             capture = json.loads(capture_path.read_text(encoding="utf-8"))
+            session_id = infer_single_common_session_id(iphone_path, watch_path)
+            if session_id is None:
+                raise RuntimeError("无法从本条 iPhone/Watch 文件唯一确定共同 sessionID")
             capture["raw_files"] = {
                 "iphone": str(iphone_path.resolve()),
                 "apple_watch": str(watch_path.resolve()),
@@ -2606,6 +2601,7 @@ def receive_and_finalize(
                 iphone_time_offset=args.iphone_time_offset,
                 watch_time_offset=args.watch_time_offset,
                 fps=args.fps,
+                session_id=session_id,
             )
             finalize_offline_capture(finalize_args)
             return "finalized"
@@ -2783,10 +2779,11 @@ def run_self_test() -> None:
     calibration = calibrate_from_files(synthetic_motion, synthetic_capture, first)
     if set(calibration) != set(DEVICES):
         raise AssertionError("offline calibration did not produce both devices")
-    if not torch.equal(
-        calibration["apple_watch"]["R_MI"], calibration["iphone"]["R_MI"]
+    if not all(
+        item.get("calibrated_independently") and item.get("R_SB") is not None
+        for item in calibration.values()
     ):
-        raise AssertionError("Apple Watch should reuse the iPhone R_MI")
+        raise AssertionError("offline calibration must produce independent R_MI and R_SB for both devices")
     synthetic_forward_quality = forward_walk_quality(
         [sample for sample in synthetic_motion[CALIBRATION_SOURCE] if 3.0 <= sample["timestamp_s"] <= 6.0],
         3.0,
@@ -2968,7 +2965,12 @@ def run_self_test() -> None:
         ]
         for source, samples in synthetic_motion.items()
     }
-    calibrate_from_files(watch_unstable_motion, synthetic_capture, first)
+    try:
+        calibrate_from_files(watch_unstable_motion, synthetic_capture, first)
+    except CalibrationError:
+        pass
+    else:
+        raise AssertionError("unstable Watch N-pose should fail per-device offline calibration")
     unstable_motion = {
         source: [
             {
@@ -2992,8 +2994,8 @@ def run_self_test() -> None:
     print("self-test passed")
     print(f"  {len(plan)} takes, first {sequence_directory(Path('train_labels'), first)}")
     print(
-        "  iPhone-only shared R_MI, exact live-sample replay, N-pose failure "
-        "detection, and model-space output passed"
+        "  per-device R_MI/R_SB, legacy trace compatibility, per-device N-pose "
+        "failure detection, and model-space output passed"
     )
 
 
@@ -3006,13 +3008,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--host",
         default="0.0.0.0",
-        help="监听 iPhone 标定 UDP；--legacy-live 也使用该地址",
+        help="仅 --legacy-live 旧实时模式使用的监听地址",
     )
     parser.add_argument(
         "--port",
         type=int,
         default=9000,
-        help="监听 iPhone 标定 UDP；--legacy-live 也使用该端口",
+        help="仅 --legacy-live 旧实时模式使用的监听端口",
     )
     parser.add_argument("--seconds", type=float, default=20.0)
     parser.add_argument("--fps", type=float, default=30.0)
@@ -3074,7 +3076,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--finalize-batch",
         action="store_true",
-        help="扫描 USB 导出的全部原始文件，按 sessionID 配对并整理所有正式序列",
+        help="扫描 USB 导出的全部原始文件，按共同 sessionID 的时间顺序配对并整理所有正式序列",
     )
     parser.add_argument(
         "--upgrade-existing-uwb",
@@ -3090,13 +3092,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iphone-file", type=Path, default=None)
     parser.add_argument("--watch-file", type=Path, default=None)
     parser.add_argument(
+        "--session-id",
+        default=None,
+        metavar="ID",
+        help="离线整理时限定一个本地设备会话；纯离线 --finalize-batch 自动填写",
+    )
+    parser.add_argument(
         "--iphone-time-offset",
         type=float,
         default=None,
         metavar="SECONDS",
         help=(
-            "离线导入时加到 iPhone timestampUnixNs 的时间偏移；默认从在线标定 "
-            "UDP 自动估计，显式传入 0 可禁用自动偏移"
+            "离线导入时加到 iPhone timestampUnixNs 的固定时间偏移；默认 0"
         ),
     )
     parser.add_argument(
@@ -3105,8 +3112,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         metavar="SECONDS",
         help=(
-            "离线导入时加到 Watch timestampUnixNs 的时间偏移；默认继承本条 "
-            "iPhone 的自动或手动偏移，显式传入可单独覆盖"
+            "离线导入时加到 Watch timestampUnixNs 的固定时间偏移；默认继承 iPhone 偏移"
         ),
     )
     parser.add_argument(
@@ -3266,10 +3272,10 @@ def main() -> None:
                     print("采集结束。已保存的序列仍在输出目录中。")
                     return
     else:
-        print("本地文件模式：只在标定阶段监听 iPhone UDP，不等待 Watch 实时数据。")
+        print("纯本地文件模式：采集期间不监听 iPhone 或 Apple Watch UDP。")
         print("每条都要在两台设备上开始一段新的本地采集；结束后等待 Watch 文件传到手机。")
         if args.defer_import:
-            print("批量模式（正式采集默认）：每条只登记 sessionID，不逐条连接 USB。")
+            print("批量模式（正式采集默认）：每条记录时间顺序，不逐条连接 USB。")
             print("所有动作录完后，把手机数据一次复制到电脑，再运行 --finalize-batch。")
         else:
             print(f"逐条导入模式：每条结束后等待文件并立即整理：{args.inbox.resolve()}")

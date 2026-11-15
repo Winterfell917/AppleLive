@@ -7,10 +7,11 @@ Default protocol:
     calibration always faces the fixed physical room 0-degree reference
     action body yaw: 0, 90, 180, 270 degrees relative to that reference
     actions at every yaw: Boxing, Waving, Walking (control)
-    calibration: the existing iPhone-only calibration is repeated per sequence
+    calibration: static-walk-static is repeated per sequence and finalized
+                 offline for both iPhone and Watch
 
-The script reuses the device-local capture, live iPhone calibration, session-ID
-matching, and offline finalization implemented by ``collect_train_sequence.py``.
+The script reuses the device-local capture and per-device offline finalization
+implemented by ``collect_train_sequence.py``. No real-time UDP is used.
 Its data are isolated from the existing train/test datasets.
 """
 
@@ -128,7 +129,7 @@ def make_experiment(args: argparse.Namespace, direction: int, action: str) -> di
         "yaw_convention": args.yaw_convention,
         "action_role": "stable_control" if action == "Walking" else "orientation_focus",
         "recalibrated_before_action": True,
-        "calibration_policy": "repeat iPhone N-pose and forward-walk calibration for every sequence while facing the fixed physical room 0-degree reference; only after calibration passes, turn to action_room_yaw_deg for the formal action; Watch reuses iPhone R_MI",
+        "calibration_policy": "repeat the static-forward-step-static calibration for every sequence while facing the fixed physical room 0-degree reference; only after the protocol is recorded, turn to action_room_yaw_deg for the formal action; offline finalization computes iPhone and Watch R_MI/R_SB independently",
         "calibration_instruction": "本协议规定：标定阶段始终面向房间固定的 0° 基准方向；不要按本条动作方向转身。N-pose 和随后向前走均沿 0° 方向完成。",
         "post_calibration_instruction": f"标定方向固定为房间 0°。现在转身面向本条正式动作方向 {direction}°，回到动作起点；不要重新标定。",
         "fixed_conditions": {
@@ -183,7 +184,7 @@ def retest_prompt(take: dict, index: int, total: int) -> str:
         "标定阶段始终面向房间固定的 0° 基准方向；N-pose 和标定向前走均沿 0° 完成。\n"
     )
     action_instruction = (
-        f"iPhone 标定成功后，再转身面向相对房间 0° 的 {direction}°方向完成正式动作。\n"
+        f"完成静止—前走—静止标定记录后，再转身面向相对房间 0° 的 {direction}°方向完成正式动作。\n"
     )
     return (
         f"\n[{index}/{total}] 房间朝向 {direction}°，{take['action']}"

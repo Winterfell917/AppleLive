@@ -99,7 +99,7 @@ def run_self_test() -> None:
         raise AssertionError(f"unexpected plan order: {actual_prefix}")
     print("self-test passed")
     print(f"  {len(plan)} unique takes: action x wear x facing, one repetition each")
-    print("  capture/calibration/finalization settings are inherited from collect_train_sequence.py")
+    print("  pure-local capture and per-device offline calibration are inherited from collect_train_sequence.py")
 
 
 def main() -> None:
@@ -186,10 +186,10 @@ def main() -> None:
                     return
         return
 
-    print("本地文件模式：只在标定阶段监听 iPhone UDP，不等待 Watch 实时数据。")
+    print("纯本地文件模式：采集期间不监听 iPhone 或 Apple Watch UDP。")
     print("每条都要在两台设备上开始一段新的本地采集；结束后等待 Watch 文件传到手机。")
     if args.defer_import:
-        print("批量模式（默认）：每条只登记 sessionID，不逐条连接 USB。")
+        print("批量模式（默认）：每条记录采集时间顺序，不逐条连接 USB。")
         print("所有动作录完后，把手机数据一次复制到测试原始文件目录，再运行 --finalize-batch。")
     else:
         print(f"逐条导入模式：每条结束后等待文件并立即整理：{args.inbox.resolve()}")

@@ -1,4 +1,9 @@
-"""Record 20 s evaluation labels from Sensor Read.
+"""Legacy real-time UDP evaluator for Sensor Read.
+
+New data collection must use ``collect_train_sequence.py``,
+``collect_eval_test.py``, or ``collect_orientation_retest.py`` instead. Those
+scripts use device-local recording and calculate per-device R_MI/R_SB offline.
+This module remains only for backwards-compatible real-time debugging.
 
 Acceleration and orientation use the same conversion as ``sensor_apple/sensor.py``:
 
@@ -626,6 +631,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument(
+        "--legacy-live",
+        action="store_true",
+        help="确认使用旧版双设备实时 UDP 采集；新数据请使用 collect_train_sequence.py",
+    )
+    parser.add_argument(
         "--once",
         action="store_true",
         help="只试录一条，写到 _trial/，不占用 40 条正式计划",
@@ -852,6 +862,12 @@ def main() -> None:
     if args.preview is not None:
         preview_sequence(args.preview)
         return
+    if not args.legacy_live:
+        raise SystemExit(
+            "collect_eval_sequence.py 是旧版实时 UDP 工具，已不用于数据采集。"
+            "请改用 collect_train_sequence.py / collect_eval_test.py / collect_orientation_retest.py；"
+            "确需复现旧实时流程时显式添加 --legacy-live。"
+        )
     if args.seconds <= 0 or args.fps <= 0 or args.npose <= 0 or args.walk <= 0:
         raise SystemExit("时长和帧率必须为正")
     if not 1 <= args.port <= 65535:
