@@ -1,0 +1,25 @@
+{
+  "schema": "apple_static_mocap_experiment_v1",
+  "watch_placement": "left_wrist",
+  "phone_placement": "right_thigh_pocket",
+  "model_combo": "lw_rp",
+  "active_model_slots": [0, 3],
+  "model_slot_count": 5,
+  "missing_slot_encoding": "zero_acceleration_and_zero_orientation_matrix",
+  "checkpoint": "data/checkpoints/base_model_12combo.pth",
+  "fps": 30,
+  "max_interpolation_gap_s": 0.15,
+  "anti_alias_vectors": true,
+  "npose_search_start_s": 0.5,
+  "npose_search_end_s": 8.0,
+  "npose_window_s": 2.0,
+  "npose_search_step_s": 0.1,
+  "npose_thresholds": {
+    "pose_p95_deg": 2.0,
+    "gyro_p95_rad_s": 0.25,
+    "user_acc_p95_g": 0.08,
+    "max_gap_s": 0.1,
+    "minimum_coverage": 0.95
+  },
+  "render": {"panel_size": 640, "view_yaws_deg": [0, 45], "root_translation": "fixed_zero"}
+}
