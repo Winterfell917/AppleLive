@@ -162,338 +162,228 @@ python apple_offline_calibration.py /path/to/session_folder \
 统一时间轴、`RIS/RSI`、时钟偏移/漂移、缺失 mask、UWB 有效期和 NPZ 字段说明见
 [多模态对齐说明](mobileposer/APPLE_OFFLINE_ALIGNMENT.md)。同一网格不等于设备已经精确对时。
 
-## Offline Apple mocap: static RMI → N-pose RSB → mesh video
+## Apple 离线动捕：从 RMI、RSB 到人体视频
 
-This workflow runs entirely offline using Sensor Read recordings from **an Apple
-Watch on the left wrist and an iPhone in the right thigh pocket**. It reproduces
-the static-calibration experiment that was visually reviewed on November 19,
-2026. No live UDP connection, AirPods, Unity, learned calibration model, or model
-training is needed. The iOS/watchOS collection app is maintained separately in
-[SmartApple_APP](https://github.com/zhanglbthu/SmartApple_APP).
+目标：用 **左腕 Apple Watch + 右大腿口袋 iPhone** 保存的数据，生成全身动作的人体网格视频。
+整个过程在电脑上离线完成，不需要实时 UDP、AirPods、Unity，也不用重新训练模型。
+采集 App 见 [SmartApple_APP](https://github.com/zhanglbthu/SmartApple_APP)。
 
-The end-to-end sequence is:
+先记住两个参数：
 
-```text
-Known physical sensor pose, held still
-  → static recording → per-device RMI
-Worn devices, opening N-pose, then natural movement
-  → mocap recording → per-device RSB from the opening N-pose
-  → timestamp alignment at 30 Hz → calibrated acceleration/orientation
-  → MobilePoser (left wrist + right pocket) → 24-joint SMPL poses → MP4
-```
+| 参数 | 解决什么问题 | 怎么得到 |
+| --- | --- | --- |
+| RMI | 每台设备的“世界坐标系”不一定相同，需要转换到模型的世界坐标系 | 把设备按已知方向放好，静止采一段数据 |
+| RSB | 设备的方向不等于手腕或大腿的方向，需要校准佩戴角度 | 戴好设备，站立保持 N-pose |
 
-### 1. Code map and prerequisites
-
-| Code | Responsibility |
-| --- | --- |
-| [apple_static_rmi.py](mobileposer/apple_static_rmi.py) | Static-RMI command-line tool and gravity/stationarity diagnostics |
-| [static_calibration.py](mobileposer/sensor_apple/static_calibration.py) | Shared RMI loading, fixed-pose calibration, quiet-window selection, and N-pose RSB math |
-| [apple_static_rmi_pose.json](mobileposer/configs/apple_static_rmi_pose.json) | Explicit, per-device fixed-pose target matrices; historical example, **not a universal Apple convention** |
-| [apple_static_mocap.py](mobileposer/apple_static_mocap.py) | End-to-end offline RSB fitting, input assembly, inference, and artifact export |
-| [apple_static_lw_rp.json](mobileposer/configs/apple_static_lw_rp.json) | Two-device placements, model slots, 30 Hz alignment, N-pose thresholds, and render settings |
-| [offline.py](mobileposer/sensor_apple/offline.py) / [alignment.py](mobileposer/sensor_apple/alignment.py) | NDJSON validation, source timestamps, resampling, and optional auxiliary channels |
-| [apple_postprocess.py](mobileposer/apple_postprocess.py) | Existing stateful model inference and four-frame look-ahead compensation |
-| [mesh_video.py](mobileposer/sensor_apple/mesh_video.py) | Front/angled SMPL views, frame labels, H.264 video, and decode verification |
-| [test_apple_static_rmi.py](tests/test_apple_static_rmi.py) / [test_apple_static_mocap.py](tests/test_apple_static_mocap.py) | Calibration, validation guards, slot mapping, and CLI regression tests |
-
-Use the installation instructions above and the `mobileposer` conda environment.
-**All commands in this section run from the repository root**, not from inside
-`mobileposer/`. Inference uses CPU with two PyTorch threads. The existing assets
-must be available at:
+手机和手表各有一套 RMI、RSB，不共用同一个矩阵。
 
 ```text
-mobileposer/data/checkpoints/base_model_12combo.pth
-mobileposer/smpl/basicmodel_m.pkl
+按已知方向静止放置设备 → 计算并保存 RMI
+戴好设备，先站立静止，再正常运动 → 用开头的 N-pose 计算 RSB
+按时间戳对齐数据 → 转换加速度和姿态 → 输入模型 → 生成 MP4
 ```
 
-Use SMPL and pretrained assets under their applicable licenses. Video rendering
-needs a working OpenGL desktop context, Open3D, and an OpenCV build with an H.264
-(`avc1`) encoder. An invisible render window is not the same as display-server-free
-rendering. Use `--skip-video` for numeric inference on a machine without these
-rendering capabilities; do not change the sensor/model pipeline to fix an encoder
-or display error.
+### 1. 准备环境和数据
 
-### 2. Coordinates and what RMI/RSB mean
-
-We use column vectors. **RXY maps coordinates from frame Y into frame X.**
-
-| Frame/matrix | Meaning |
-| --- | --- |
-| M | Chosen right-handed model/world frame: +Y up; +Z chosen forward; +X completes the frame |
-| I | Each device's inertial reference frame; the phone and Watch need not share the same I |
-| S | Sensor frame after the existing receiver's coordinate conversion |
-| B | Model bone frame associated with the sensor's body slot |
-| RIS / RSI | S → I rotation / its transpose I → S |
-| RMI | I → M; estimated separately for each device from a known physical orientation |
-| RSB | B → S; mounting offset estimated separately from the worn N-pose |
-| RMB | B → M; the calibrated bone orientation supplied to the network |
-
-The current repository convention is preserved, including its historical Z-axis
-reflection. It is an implementation convention, **not a claim that Apple's
-documented axes are left-handed**. With `Q` the matrix stored as `rotation_m11`
-through `rotation_m33` in NDJSON:
-
-```python
-C = diag(1, 1, -1)
-RIS = C @ Q.T @ C
-RSI = RIS.T
-aS = C @ user_accel_g * 9.80665       # gravity-removed acceleration, m/s²
-gyroS = -C @ rotation_rate_rad_s      # axial-vector reflection convention
-```
-
-Do not apply this conversion twice. Raw JSON is never rewritten. The model uses
-`device_motion` user acceleration and attitude, not the independent raw
-accelerometer channel that includes gravity.
-
-### 3. Record and calculate RMI from a known static pose
-
-1. Define model +Y (up) and +Z (your chosen forward direction) physically.
-2. Place each device in a **known orientation**, with its axes identified. The
-   devices can have different orientations; specify a separate target for each.
-3. Start a static recording, allow handling to settle, hold the known poses for
-   at least 5–10 seconds, and stop. Recording 12–20 seconds leaves useful margins.
-4. Wait for the Watch's files to arrive on the iPhone, then copy the complete
-   session folder to the computer. Both `iphone-events-*.ndjson` and
-   `apple_watch-events-*.ndjson` must be present and have the same `sessionID`.
-   `.wav`, receipt, and session-info files may remain in the folder; these tools
-   only read the immediate `*.ndjson` files and do not traverse older sessions.
-5. Specify the known rotation `RMS_target` (S → M) in a pose-config JSON. Its
-   **columns are the processed sensor's +X, +Y, +Z axes expressed in M**. They must
-   be orthonormal with determinant +1. If `P_raw` expresses the independently
-   established raw axes in M, use `RMS_target = P_raw @ C` for this pipeline.
-   Do not invent a sign change merely to force the determinant to +1.
-
-A stationary sequence does **not** by itself reveal the physical heading. The
-known pose supplies information that gravity alone cannot provide. Given the
-SO(3) mean of the stable orientations, calculated with SVD projection:
-
-```python
-RMI = RMS_target @ mean_RIS_static.T
-```
-
-The provided pose config reproduces the earlier back-up sketch experiment:
-
-```text
-RMS_target = [-1  0  0
-              0  0 -1
-              0 -1  0]      # historical example for both devices
-```
-
-**That historical target failed the independent gravity-down check on the real
-recording.** Keep it unchanged to reproduce that experiment; do not treat it as a
-validated mounting recipe for other devices. For a new validated setup, copy the
-config and replace `RMS_targets` with independently verified axes. The tool
-requires `--pose-config` explicitly rather than silently selecting the example.
+先按上面的“安装”部分准备环境。**本节命令都在仓库根目录运行**，不要先进入 mobileposer 子目录。
 
 ```bash
 conda activate mobileposer
+```
 
+确认以下两个文件存在：
+
+```text
+mobileposer/data/checkpoints/base_model_12combo.pth   # 动作估计模型
+mobileposer/smpl/basicmodel_m.pkl                    # SMPL 人体模型
+```
+
+每次采集结束后，先等手表文件传到手机，再把该次采集的整个文件夹复制到电脑。
+文件夹至少需要包含：
+
+```text
+iphone-events-<sessionID>.ndjson
+apple_watch-events-<sessionID>.ndjson
+```
+
+两份文件必须属于同一次采集（sessionID 相同）。音频、回执等文件可以保留，程序不会把它们作为动捕模型输入。
+下面命令中的 `/path/to/...` 都要替换成自己的数据目录。
+
+### 2. 先计算 RMI：已知方向的静止采集
+
+1. 选定模型世界坐标：+Y 向上，+Z 是你指定的前方，+X 按右手坐标系确定。
+2. 把手机和手表分别按**已知的物理方向**放好。它们可以朝向不同，但各自的轴向必须明确。
+3. 点击开始后，等待操作造成的晃动结束，再静止保持约 8–10 秒。整段录制 12–20 秒更方便排除首尾操作。
+4. 将该序列复制到电脑，填写固定姿态配置，再运行：
+
+```bash
 python mobileposer/apple_static_rmi.py /path/to/static_session \
   --pose-config mobileposer/configs/apple_static_rmi_pose.json \
   --window-seconds 8 \
   --output mobileposer/data/static_rmi/my_static_pose
 ```
 
-Automatic selection excludes one second at each end of the common coverage and
-searches an eight-second window in 0.25-second steps. `--window-seconds` accepts
-5–10 seconds. To select a specific interval instead, add `--window START END`,
-also spanning 5–10 seconds. All bounds are relative to the **earliest
-device-motion sample**, not the button-press time.
+配置文件里的 `RMS_targets` 分别描述手机和手表的已知方向。
+每个矩阵的三列，是**经过程序坐标转换后的传感器 +X、+Y、+Z 轴在模型世界坐标系中的方向**。
+不能仅凭“设备静止”自动猜出这个矩阵；静止本身不能确定朝向。
 
-Checks include rotation validity, one session per input, increasing timestamps
-and sequence numbers, clock discontinuities, a constant attitude-reference-frame
-label, and sufficient shared coverage. Static-window limits are:
+**注意：仓库自带的配置用于复现之前的草图实验，不是所有 Apple 设备通用的摆放规则。**
+该实验的重力方向检查没有通过。要复现实验可保留它；要做严格验证，应先确认物理轴向，再修改配置。
 
-| Check | Limit |
-| --- | ---: |
-| Orientation deviation from the mean, P95 | ≤ 2° |
-| Angular-speed norm, P95 | ≤ 0.05 rad/s |
-| User-acceleration norm, P95 | ≤ 0.05 g |
-| Maximum sample gap | ≤ 0.1 s |
-| Window coverage | ≥ 95% |
-| Gravity angle from model −Y, P95 | ≤ 5° |
+程序会自动选择两台设备都比较稳定的 8 秒，主要输出：
 
-Outputs are `calibration.json`, `candidate_rmi.npz`, `diagnostic.png`, and
-`pose_config_snapshot.json`. Each source has its own `candidate_RMI`, statistics,
-reference-frame counts, and validation issues. Input-file hashes are recorded.
+- `calibration.json`：每台设备的 RMI、检查结果和时间区间。
+- `diagnostic.png`：静止区间和运动信号，方便检查有没有选到晃动。
+- `candidate_rmi.npz`、`pose_config_snapshot.json`：矩阵及本次使用的配置。
 
-An exit code of **2** can mean the diagnostics were successfully saved but the
-coordinate check failed; inspect `calibration.json` rather than assuming no file
-was produced. Passing internal checks still does not verify absolute heading or
-the correctness of the manually declared physical pose. Existing output folders
-are never overwritten.
+也可以用 `--window START END` 手动指定 5–10 秒的区间。
+时间从**两端最早的一条 device_motion 样本**开始计，不是从按按钮开始计。
 
-### 4. Record the mocap sequence and estimate RSB
+如果显示 `blocked_coordinate_validation` 或返回码为 2，先看输出目录里的检查结果：
+可能已经保存了候选矩阵，但方向检查没有通过。不要把“生成了文件”理解成“校准正确”。
 
-Wear the Watch on the **left wrist** and put the iPhone in the **right thigh
-pocket**. Keep the strap, pocket, and phone orientation fixed throughout the
-sequence. After pressing Start, stand in an N-pose facing the chosen model +Z:
-upright, arms down naturally, wrists neutral. Allow button interaction to finish,
-hold still for several seconds, then perform the movements you want to evaluate.
-Moving the phone to another pocket, changing its orientation within the pocket,
-or changing the Watch mounting requires a new mounting calibration.
+### 3. 再采动作：开头保持 N-pose
 
-The default config searches only the first **0.5–8.0 seconds**, choosing a common
-two-second quiet window in 0.1-second steps. It does not search the whole recording
-for a later pause. These worn-pose limits are intentionally less strict than the
-tabletop RMI limits: orientation P95 ≤ 2°, gyro P95 ≤ 0.25 rad/s, user acceleration
-P95 ≤ 0.08 g, gap ≤ 0.1 s, and coverage ≥ 95%. Stillness is only a quality check;
-it cannot identify an N-pose or establish which direction the person faces.
+手表戴在**左腕**，手机放在**右大腿口袋**，整段过程中不要换位置或改变佩戴方向。
 
-For each device, the N-pose bone target comes from `NPOSE_RMB` in
-[sensor.py](mobileposer/sensor_apple/sensor.py):
+点击开始后：
 
-```text
-Left-wrist target (slot 0)       Right-thigh target (slot 3)
-[ 0  1  0 ]                    [ 1  0  0 ]
-[-1  0  0 ]                    [ 0  1  0 ]
-[ 0  0  1 ]                    [ 0  0  1 ]
-```
+1. 面向之前选定的模型 +Z 方向，站直、双臂自然下垂、手腕放松，这就是这里的 N-pose。
+2. 等点击按钮造成的动作结束，静止保持几秒，尽量在开头 8 秒内留出至少 2 秒稳定区间。
+3. 开始正常运动，结束后把两端数据复制到电脑。
 
-The mounting rotation is fitted without changing the saved RMI:
+不需要另开程序单独计算 RSB；下一步会自动从这段序列的开头计算。
 
-```python
-RSB = (RMI @ mean_RIS_N).T @ target_RMB_N
-RMB = RMI @ RIS @ RSB
-aI = RIS @ aS
-aM = RMI @ aI
-aB = RSB.T @ aS                # optional bone-frame acceleration export
-```
+### 4. 计算 RSB、运行模型并生成视频
 
-`RSB` belongs in the orientation chain. **Do not additionally multiply `aM` by
-RSB**: `aS` is already a vector in S, and `RMI @ RIS` maps it directly into M.
-As a consistency check, `RMB @ aB` equals `aM`.
-
-### 5. Align the recordings and run mocap evaluation
-
-For an RMI artifact that passes the loader's same-session/internal checks:
+下面的命令用于复现我们已经看过效果的流程：使用保存的 RMI，从动作序列的第 4–6 秒计算 RSB，再运行模型。
 
 ```bash
 python mobileposer/apple_static_mocap.py \
   --session /path/to/mocap_session \
   --rmi mobileposer/data/static_rmi/my_static_pose/calibration.json \
   --config mobileposer/configs/apple_static_lw_rp.json \
+  --npose 4 6 \
+  --allow-unverified-rmi \
   --output mobileposer/data/static_rmi_eval/my_mocap
 ```
 
-If static RMI and mocap come from **separate recordings**, the inertial reference
-may have changed. By default, reuse is refused even if both sessions have the same
-attitude-reference-frame label. For an intentional **exploratory replay**, as in
-the visually reviewed experiment, append `--allow-unverified-rmi`:
+几个参数需要注意：
 
-```bash
-python mobileposer/apple_static_mocap.py \
-  --session /path/to/mocap_session \
-  --rmi /path/to/saved_static_rmi/calibration.json \
-  --config mobileposer/configs/apple_static_lw_rp.json \
-  --npose 4 6 \
-  --allow-unverified-rmi \
-  --output mobileposer/data/static_rmi_eval/my_exploratory_replay
-```
-
-`--npose 4 6` reproduces the reviewed recording's selected interval. It is **not a
-universal window**: omit it for opening-window detection or choose checked bounds
-appropriate for another sequence. Manual bounds still undergo motion/coverage
-checks. The explicit RMI override permits a diagnostic run; it neither changes
-the source artifact nor removes its failed-validation status. It cannot bypass
-invalid matrices, an incompatible coordinate convention, missing motion data,
-or the lack of a usable N-pose interval.
-
-Processing details:
-
-- **Timing:** subtract integer Unix nanoseconds before converting to relative
-  seconds; use the intersection of the devices' coverage. The default assumes
-  their recorded Unix clocks agree—no physical clock synchronization is inferred.
-- **Resampling:** a 30 Hz common grid; SLERP for orientation; linear interpolation
-  and offline zero-phase fourth-order low-pass filtering for high-rate vectors
-  (cutoff 12 Hz). No extrapolation or interpolation across gaps over 0.15 seconds.
-  If any required aligned motion frame is invalid, inference stops.
-- **Auxiliary channels:** raw accelerometer/gyro/magnetometer channels and UWB
-  are included when present. Missing channels remain missing. UWB uses causal
-  hold with a 0.3-second expiry, not fabricated new measurements. Audio is not
-  synchronized or used by this runner. See [alignment details](mobileposer/APPLE_OFFLINE_ALIGNMENT.md).
-- **Model inputs:** five fixed slots: left wrist (0), right wrist (1), left thigh
-  (2), right thigh (3), head (4). Only 0 and 3 are active. Both acceleration and
-  orientation matrices in the other slots are **zeros**, not identity matrices.
-  The 60-dimensional input is `[flatten(aM / 30), flatten(RMB)]`: 15 acceleration
-  values followed by 45 orientation values. Gyroscope, UWB, audio, and raw
-  magnetometer are not direct inputs to this checkpoint.
-- **Model:** the existing `base_model_12combo.pth`, with no learned calibrator or
-  retraining. This is a five-slot checkpoint used with two active slots, not a
-  newly trained two-device model. Configuration changes are local to this runner;
-  the live demo's global config file is not edited.
-- **Temporal state:** reset once per recording, then use `forward_frame` for
-  every input. Compensate the model's four-frame look-ahead by appending four
-  copies of the final input and discarding four startup outputs. Startup and
-  tail boundary effects still exist; poses are not post-smoothed.
-- **Rendering:** generic SMPL body, front and angled views, fixed global root,
-  30 FPS. Display-only camera/mesh transforms never alter saved model outputs.
-  The MP4 is read back to verify frame count, FPS, and complete decoding.
-
-### 6. Outputs, reuse, and interpretation
-
-| Output in the evaluation folder | Contents |
+| 参数 | 含义 |
 | --- | --- |
-| `calibration.json` | Per-source RMI and fitted RSB, body slots, N-pose bounds/quality, source RMI hash, and override reasons |
-| `rmi_source_snapshot.json` | Unmodified content of the input RMI artifact |
-| `effective_config.json` | Exact placements, thresholds, checkpoint choice, and renderer settings |
-| `native_sensor_arrays.npz` | Native sample times and parsed sensor arrays; motion arrays already use the receiver's axis/unit conversion, so this is **not a byte-for-byte raw recording** |
-| `aligned_sensors.npz` | Common timestamps, source-axis RIS/RSI, acceleration/gyro, validity masks, interpolation brackets, and available auxiliary channels |
-| `model_io.npz` | `input_60d` `[T,60]`, `pose_local_rotation` `[T,24,3,3]`, `acc_M_slots` `[T,5,3]`, `ori_MB_slots` `[T,5,3,3]`, `acc_B_sources` `[T,2,3]`, timestamps, and active-slot mask |
-| `mocap_result.pt` | PyTorch tensors, estimated poses, calibration/config snapshots, source ordering, and look-ahead metadata |
-| `npose_diagnostics.png` | Full-sequence acceleration, angular speed, and orientation deviation with the selected interval highlighted |
-| `mocap_mesh.mp4` / `preview_contact_sheet.jpg` | Full video and six sampled frames; omitted with `--skip-video` |
-| `report.json` | Input/checkpoint/code hashes, runtime versions, alignment checks, warnings, and video decode results |
+| `--session` | 动作序列文件夹，不是前面的静态序列 |
+| `--rmi` | 前面保存的 RMI 文件 |
+| `--npose 4 6` | 用第 4–6 秒拟合 RSB；这是之前那段数据的设置，不适合直接套用所有序列 |
+| `--allow-unverified-rmi` | 明确允许一次探索性测试，包括跨序列复用或未通过方向检查的 RMI；不会把它标记为验证通过 |
+| `--output` | 新的输出目录；已有目录不会被覆盖 |
+| `--skip-video` | 只保存计算结果，不渲染视频 |
 
-The source order in the default aligned arrays is **Watch, iPhone**, while model
-arrays use the five fixed slots above. Always read `source_names`/`source_slots`
-rather than assuming a column order. `time_from_recording_origin_s` in the NPZ
-and `time_relative_s` in the PT are relative to the earliest motion sample. In
-`aligned_sensors.npz`, `time_relative_s` starts at the first common grid sample.
-Use `timestamp_unix_ns` to relate the files precisely.
+对于新的序列，可以去掉 `--npose 4 6`，程序会在开头 0.5–8 秒中自动寻找两端共同稳定的 2 秒。
+手动指定的区间也会检查稳定性。**程序只能检查是否静止，不能判断你是否真的摆出了 N-pose。**
+
+如果 RMI 已通过内部检查且来自同一次采集，可不加 `--allow-unverified-rmi`。
+如果来自不同采集，程序默认会拒绝复用，因为重新初始化后参考系可能变化；同样的参考系编号也不代表方向完全一致。
+
+程序接下来会：
+
+- 将两端的有效重叠数据对齐到 **30 Hz**；姿态做旋转插值，加速度等向量做滤波和插值。
+- 不跨越超过 0.15 秒的缺口补数据；必需的运动数据不完整时停止推理。
+- 把左腕放入模型槽位 0，右大腿放入槽位 3，其他槽位的加速度和姿态矩阵填零。
+- 使用现有模型计算 24 个关节的姿态，再渲染人体网格。
+
+当前模型直接使用的是**去除重力的加速度 + 姿态**，不直接使用角速度、UWB、磁力计或音频。
+这些其他模态有数据时可另外分析，但不会自动参与本次动作估计。
+
+### 5. 查看哪些结果
+
+在输出目录中，先看这几个文件：
+
+| 文件 | 用途 |
+| --- | --- |
+| `mocap_mesh.mp4` | 人体网格视频，包含正面和斜侧面视角 |
+| `npose_diagnostics.png` | 检查开头选中的校准区间是否稳定 |
+| `calibration.json` | 查看手机、手表各自的 RMI 和 RSB |
+| `model_io.npz` | 查看实际模型输入和预测姿态，便于后续分析 |
+| `aligned_sensors.npz` | 查看按共同时间轴整理的传感器数据和有效标记 |
+| `report.json` | 查看配置、时间对齐、输入文件校验和运行警告 |
+
+完整结果还包括原采样时间的数据数组、PyTorch 结果、配置副本和视频截图。
+数组中部分数据已经转换了轴向和单位，**不等于原始文件**；原始 NDJSON 不会被修改，应另行保留。
+
+读取模型输出的简单示例：
 
 ```python
 import numpy as np
 
-result = np.load("mobileposer/data/static_rmi_eval/my_mocap/model_io.npz",
-                 allow_pickle=False)
-pose = result["pose_local_rotation"]  # SMPL local joint rotations, not vertices
-acc = result["acc_M_slots"]
-orientation = result["ori_MB_slots"]
+data = np.load("mobileposer/data/static_rmi_eval/my_mocap/model_io.npz",
+               allow_pickle=False)
+pose = data["pose_local_rotation"]  # [帧数, 24, 3, 3]：关节局部旋转矩阵
+acc = data["acc_M_slots"]           # [帧数, 5, 3]：模型世界系中的加速度
+ori = data["ori_MB_slots"]          # [帧数, 5, 3, 3]：校准后的骨骼姿态
 ```
 
-The recorded NDJSON files stay unchanged. Keep them with the calibration and
-report for later reprocessing. Prefer the pickle-free NPZ format when sharing;
-only load `.pt` files from trusted sources. RSB can be reused only while mounting
-and the relevant coordinate references remain unchanged. A new pose/config or
-recording should use a new output directory.
+先看 N-pose 结束后的动作：左右是否对应、抬手方向是否正确、是否抖动或出现不合理弯曲。
+视频固定人体根部位置，主要看姿态，**不能用来评价真实行走轨迹**。
+之前测试得到 545 帧、30 FPS，约 18.2 秒的视频，视觉效果符合预期。
 
-The reviewed real-device test selected **4.0–6.0 seconds**, produced **545 frames
-at 30 Hz (~18.2 seconds)**, and met the user's visual expectations. Inspect motion
-after the N-pose, including left/right correspondence, limb rotation direction,
-jitter, implausible bending, and whether motions match what was performed.
-Initial button handling is included in the video and should not be mistaken for
-the calibration pose. The fixed-root video does not evaluate global translation,
-distance traveled, or foot sliding caused by omitting translation.
+### 6. 简要原理与注意事项
 
-**Visual plausibility is not quantitative calibration validation.** The N-pose
-fit enforces pose closure by construction, and a neural model can hide calibration
-errors. In the historical run, the saved sketch-based RMI still had a gravity-sign
-validation failure, and cross-session inertial-frame consistency was unverified.
-Gravity checks do not resolve yaw; a shared timestamp grid does not prove clock
-synchronization. Use independent known poses, repeatability tests, and ultimately
-reference motion capture/video before making accuracy claims.
+记号约定：`RXY` 表示把 Y 坐标系中的向量转换到 X 坐标系。
+M 是模型世界系，I 是设备参考系，S 是转换后的传感器系，B 是骨骼系。
 
-Run the regression suite from the repository root:
+核心计算如下，手机和手表分别计算：
+
+```python
+RMI = RMS_target @ mean_RIS_static.T        # 用已知固定方向校准参考系
+RSB = (RMI @ mean_RIS_N).T @ target_RMB_N    # 用 N-pose 校准佩戴方向
+RMB = RMI @ RIS @ RSB                      # 得到骨骼在模型世界系中的姿态
+aM = RMI @ RIS @ aS                        # 得到模型世界系中的加速度
+```
+
+这里的平均姿态是通过 SVD 得到的旋转矩阵，不是直接平均欧拉角。
+`aS` 已经在传感器系中，所以计算 `aM` 时**不要再额外乘 RSB**。
+
+程序保留了之前实验的坐标转换；不要对已处理的数据重复转换：
+
+```python
+import numpy as np
+
+C = np.diag([1, 1, -1])
+RIS = C @ Q.T @ C                    # Q 为 NDJSON 中保存的旋转矩阵
+RSI = RIS.T
+aS = C @ user_accel_g * 9.80665       # 转为 m/s²，已去除重力
+```
+
+这只是本项目当前采用的约定，不是在断言 Apple 官方坐标系是左手系。
+更详细的时间戳、缺失值和 UWB 处理规则见 [多模态对齐说明](mobileposer/APPLE_OFFLINE_ALIGNMENT.md)。
+
+最后记住三点：
+
+- **动作看起来自然，不等于校准已经严格验证。** N-pose 拟合和模型本身可能掩盖错误；之前保存的 RMI 仍有重力方向检查问题。
+- **同一时间网格，不等于设备时钟已经精确同步。** 当前流程默认使用记录中的 Unix 时间，没有独立验证两台设备的物理时间差。
+- **换佩戴方式要重新算 RSB；跨初始化复用 RMI 要检查参考系。** 有条件时，用已知姿态、重复采集或参考视频进一步验证。
+
+视频渲染需要 Open3D、OpenGL 图形环境和 H.264 编码支持，SMPL 和权重需遵守各自许可。
+若机器不支持渲染，可先加 `--skip-video` 保存计算结果。
+录制数据和生成结果放在被 Git 忽略的 `mobileposer/data/` 中，不会随代码上传。
+
+### 7. 对应代码
+
+| 代码 | 作用 |
+| --- | --- |
+| [apple_static_rmi.py](mobileposer/apple_static_rmi.py) | 静态 RMI 计算入口 |
+| [apple_static_mocap.py](mobileposer/apple_static_mocap.py) | RSB 计算、模型推理与视频生成入口 |
+| [static_calibration.py](mobileposer/sensor_apple/static_calibration.py) | 校准公式、稳定区间选择与检查 |
+| [alignment.py](mobileposer/sensor_apple/alignment.py) | 不同采样率的数据对齐 |
+| [mesh_video.py](mobileposer/sensor_apple/mesh_video.py) | 人体网格视频渲染 |
+| [静态摆放配置](mobileposer/configs/apple_static_rmi_pose.json) / [动捕配置](mobileposer/configs/apple_static_lw_rp.json) | 固定方向、佩戴位置、帧率等设置 |
+
+检查代码是否正常，可在仓库根目录运行：
 
 ```bash
 python -m unittest discover -s tests -v
 ```
-
-Raw recordings, generated arrays, personal calibration matrices, and videos belong
-under the Git-ignored `mobileposer/data/` tree. They are not included in the source
-push. Only source code, generic configs, documentation, and synthetic-data tests
-are part of this workflow's Git changes.
 
 ## 华为设备动作捕捉
 
