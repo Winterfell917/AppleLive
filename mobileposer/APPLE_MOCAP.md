@@ -1,5 +1,8 @@
 # Sensor Read Apple IMU live demo
 
+For device-local NDJSON recordings without live transmission, see
+[offline walking calibration](APPLE_OFFLINE_CALIBRATION.md).
+
 This integration consumes the UDP JSON protocol produced by the sibling
 `sensor_read` iOS/watchOS project and sends Apple Watch, iPhone, and AirPods
 motion data into MobilePoser.

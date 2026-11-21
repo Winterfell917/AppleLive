@@ -1,0 +1,12 @@
+{
+  "schema": "apple_static_rmi_pose_v1",
+  "name": "historical_back_up_sketch_unverified",
+  "description": "Reproduces the previously evaluated sketch-based target. This is not a universal Apple mounting convention. The historical recording failed the independent gravity-down check; retain that result as an explicit diagnostic, not a validated calibration.",
+  "model_axes": {"Y": "physical up", "Z": "page-top / chosen forward", "X": "completes a right-handed frame (page-left in the original sketch)"},
+  "sensor_pose": "Original sketch: devices back-up, raw X page-right, raw Y page-down, raw Z out of page. These signs remain physically unverified.",
+  "C": [[1, 0, 0], [0, 1, 0], [0, 0, -1]],
+  "RMS_targets": {
+    "iphone": [[-1, 0, 0], [0, 0, -1], [0, -1, 0]],
+    "apple_watch": [[-1, 0, 0], [0, 0, -1], [0, -1, 0]]
+  }
+}
