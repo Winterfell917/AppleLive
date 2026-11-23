@@ -1,0 +1,16 @@
+{
+  "schema": "apple_static_rmi_pose_v1",
+  "name": "new_datasets_back_up_head_to_model_forward",
+  "description": "new_datasets 0rmi protocol: iPhone and Apple Watch lie back-up, with the device head (+S_Y after receiver conversion) pointing toward model +Z. Model +Y is physical up.",
+  "model_axes": {
+    "Y": "physical up",
+    "Z": "declared forward direction",
+    "X": "completes the right-handed model frame"
+  },
+  "sensor_pose": "Both devices are back-up. Converted sensor +Y points toward model +Z, converted sensor +Z points toward model +Y, and converted sensor +X points toward model -X.",
+  "C": [[1, 0, 0], [0, 1, 0], [0, 0, -1]],
+  "RMS_targets": {
+    "iphone": [[-1, 0, 0], [0, 0, 1], [0, 1, 0]],
+    "apple_watch": [[-1, 0, 0], [0, 0, 1], [0, 1, 0]]
+  }
+}

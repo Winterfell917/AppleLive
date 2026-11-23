@@ -229,7 +229,7 @@ python mobileposer/apple_static_rmi.py /path/to/static_session \
   --output mobileposer/data/static_rmi/my_static_pose
 ```
 
-配置文件里的 `RMS_targets` 分别描述手机和手表的已知方向。
+配置文件里的 `RMS_target s` 分别描述手机和手表的已知方向。
 每个矩阵的三列，是**经过程序坐标转换后的传感器 +X、+Y、+Z 轴在模型世界坐标系中的方向**。
 不能仅凭“设备静止”自动猜出这个矩阵；静止本身不能确定朝向。
 

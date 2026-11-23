@@ -30,10 +30,17 @@ def render_mesh(pose, output, times, bounds, fps, render_config,
     visualizer = o3d.visualization.Visualizer()
     if not visualizer.create_window(width=size, height=size, visible=False):
         raise RuntimeError("Could not create OpenGL render window")
-    writer = cv2.VideoWriter(str(output), cv2.VideoWriter_fourcc(*"avc1"), fps, (width, height))
-    if not writer.isOpened():
+    writer = None
+    codec = None
+    for candidate in ("mp4v", "avc1", "XVID"):
+        trial = cv2.VideoWriter(str(output), cv2.VideoWriter_fourcc(*candidate), fps, (width, height))
+        if trial.isOpened():
+            writer, codec = trial, candidate
+            break
+        trial.release()
+    if writer is None:
         visualizer.destroy_window()
-        raise RuntimeError("An H.264 encoder is required for the preview MP4")
+        raise RuntimeError("No MP4-compatible OpenCV video encoder is available")
     samples, view = [], visualizer.get_view_control()
     try:
         visualizer.add_geometry(mesh)
@@ -109,5 +116,5 @@ def render_mesh(pose, output, times, bounds, fps, render_config,
     capture.release()
     if decoded != len(pose) or frame_count != len(pose) or abs(actual_fps - fps) > .01:
         raise RuntimeError(f"MP4 validation failed: expected {len(pose)}, decoded {decoded}")
-    return {"codec": "H.264", "frames": decoded, "fps": actual_fps, "duration_s": decoded / actual_fps,
+    return {"codec": codec, "frames": decoded, "fps": actual_fps, "duration_s": decoded / actual_fps,
             "width": width, "height": height, "translation": "fixed_zero", "post_smoothing": False}
